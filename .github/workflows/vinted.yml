@@ -30,6 +30,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Dipendenze
+        run: pip install --quiet langdetect
+
       - name: Controlla gli annunci
         env:
           TELEGRAM_TOKEN: ${{ secrets.VINTED_TELEGRAM_TOKEN }}
