@@ -114,16 +114,16 @@
       "9872444911": "2026-11-18"
     }
   },
-  "ultimo_giro": "2026-11-18T07:12",
+  "ultimo_giro": "2026-11-18T07:16",
   "watches": [
     {
+      "escludi": [
+        "one"
+      ],
       "max": 280.0,
       "min": 150.0,
       "q": "xbox x",
-      "stati": [],
-      "escludi": [
-        "one"
-      ]
+      "stati": []
     }
   ]
 }
