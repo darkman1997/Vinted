@@ -139,7 +139,7 @@ def menu_principale() -> dict:
 # --------------------------------------------------------------------------
 
 def stato_vuoto() -> dict:
-    return {"watches": [], "seen": {}, "last_update_id": 0}
+    return {"watches": [], "seen": {}, "last_update_id": 0, "mod": None}
 
 
 def carica_stato() -> dict:
@@ -152,6 +152,9 @@ def carica_stato() -> dict:
         return stato_vuoto()
     base = stato_vuoto()
     base.update({k: s.get(k, base[k]) for k in base})
+    for w in base["watches"]:
+        if w.get("solo_italia") and not w.get("paese"):
+            w["paese"] = "it"
     return base
 
 
@@ -161,8 +164,9 @@ def salva_stato(s: dict) -> None:
 
 
 def chiave(w: dict) -> str:
-    return "{}|{}|{}|{}".format(w["q"].strip().lower(), w.get("min") or "",
-                                w.get("max") or "", ",".join(w.get("stati") or []))
+    return "{}|{}|{}|{}|{}|{}".format(w["q"].strip().lower(), w.get("min") or "",
+                                      w.get("max") or "", ",".join(w.get("stati") or []),
+                                      paese_di(w), ",".join(w.get("escludi") or []))
 
 
 # --------------------------------------------------------------------------
@@ -306,7 +310,9 @@ BENVENUTO = (
 AIUTO = (
     "Comandi:\n"
     "/aggiungi parole… [prezzo o 5-20] [nuovo/ottimo/buono] — es. /aggiungi harry potter blu-ray 5-20 nuovo\n"
-    "/lista — ricerche attive\n"
+    "/lista — ricerche attive (✏️ per modificarle)\n"
+    "/modifica numero prezzo — es. /modifica 1 30 oppure /modifica 1 10-30\n"
+    "/modifica numero nazione — italia, francia, spagna, germania… oppure tutte\n"
     "/togli numero — toglie una ricerca\n"
     "/controlla — controllo subito\n"
     "/aiuto — questo messaggio"
@@ -314,6 +320,38 @@ AIUTO = (
 
 
 NOMI_STATO = {"6": "nuovo con cartellino", "1": "nuovo senza cartellino", "2": "ottimo", "3": "buono", "4": "discreto"}
+
+# paese = lingua in cui e' scritto l'annuncio (Vinted non espone il paese vero)
+PAESI = {
+    "italia": "it", "italiano": "it", "it": "it",
+    "francia": "fr", "francese": "fr", "fr": "fr",
+    "spagna": "es", "spagnolo": "es", "es": "es",
+    "germania": "de", "tedesco": "de", "de": "de",
+    "portogallo": "pt", "portoghese": "pt", "pt": "pt",
+    "olanda": "nl", "paesi bassi": "nl", "olandese": "nl", "nl": "nl",
+    "polonia": "pl", "polacco": "pl", "pl": "pl",
+    "belgio": "nl", "belga": "nl",
+    "regno unito": "en", "inghilterra": "en", "inglese": "en", "uk": "en", "gb": "en", "en": "en",
+}
+NOMI_PAESE = {"it": "Italia", "fr": "Francia", "es": "Spagna", "de": "Germania",
+              "pt": "Portogallo", "nl": "Olanda", "pl": "Polonia", "en": "Regno Unito"}
+
+
+def paese_da(testo: str) -> str | None:
+    """'italia' -> 'it'. 'tutte'/'nessuna'/'no' -> '' (nessun filtro). None se non capito."""
+    t = " ".join((testo or "").lower().split())
+    if not t:
+        return None
+    if t in ("tutte", "tutti", "nessuna", "nessuno", "no", "any", "mondo"):
+        return ""
+    return PAESI.get(t, t if t in NOMI_PAESE else None)
+
+
+def paese_di(w: dict) -> str:
+    """Paese filtrato per una ricerca (compatibile con il vecchio solo_italia)."""
+    if w.get("paese"):
+        return w["paese"]
+    return "it" if w.get("solo_italia") else ""
 
 
 def pezzi_prezzo(w: dict) -> str:
@@ -338,8 +376,8 @@ def descrivi(w: dict, i: int) -> str:
     coda = (" · " + testo) if testo else ""
     if w.get("escludi"):
         coda += " · senza " + ", ".join(w["escludi"])
-    if w.get("solo_italia"):
-        coda += " · solo Italia"
+    if paese_di(w):
+        coda += " · solo " + NOMI_PAESE.get(paese_di(w), paese_di(w).upper())
     return "{}. {}{}".format(i, w["q"], coda)
 
 
@@ -378,7 +416,7 @@ def aggiungi_da_testo(s: dict, testo: str) -> dict | None:
     if not query:
         return None
     nuova = {"q": query, "max": prezzo_max, "min": prezzo_min, "stati": stati or [],
-             "solo_italia": solo_italia, "escludi": escludi}
+             "paese": "it" if solo_italia else "", "escludi": escludi}
     if any(chiave(w) == chiave(nuova) for w in s["watches"]):
         return nuova
     s["watches"].append(nuova)
@@ -387,14 +425,67 @@ def aggiungi_da_testo(s: dict, testo: str) -> dict | None:
     return nuova
 
 
+def leggi_prezzo(testo: str):
+    """'25' -> (None, 25) ; '10-30' -> (10, 30) ; '10 a 30'/'10 30' idem ; None se non e' un prezzo."""
+    t = (testo or "").strip().replace("€", "").replace(" ", " ").strip()
+    t = re.sub(r"\s*(?:-|–|a|fino a|to)\s*", "-", t) if re.search(r"\d\s*(?:-|–|a|fino a)\s*\d", t) else t
+    num = r"\d+(?:[.,]\d{1,2})?"
+    m = re.fullmatch(r"(%s)-(%s)" % (num, num), t)
+    if m:
+        return (float(m.group(1).replace(",", ".")), float(m.group(2).replace(",", ".")))
+    m = re.fullmatch(num, t)
+    if m:
+        return (None, float(m.group(0).replace(",", ".")))
+    return None
+
+
+def modifica_ricerca(s: dict, i: int, campo: str, valore) -> str:
+    """Cambia prezzo o nazione della ricerca numero i (0-based) e riparte da una base pulita."""
+    w = s["watches"][i]
+    vecchia = chiave(w)
+    if campo == "prezzo":
+        w["min"], w["max"] = valore
+    else:
+        w["paese"] = valore or ""
+    w.pop("solo_italia", None)
+    if chiave(w) != vecchia:
+        s["seen"].pop(vecchia, None)
+    return "Aggiornata ✅\n" + descrivi(w, i + 1) + "\nRiparto dagli annunci già online, senza raffica."
+
+
+def menu_modifica(s: dict, i: int) -> None:
+    w = s["watches"][i]
+    invia("<b>✏️ Modifico la ricerca " + str(i + 1) + "</b>\n" + descrivi(w, i + 1) +
+          "\n\nCosa cambio?",
+          {"inline_keyboard": [
+              [{"text": "💶 Prezzo", "callback_data": "ep:{}".format(i + 1)},
+               {"text": "🌍 Nazione", "callback_data": "ecm:{}".format(i + 1)}],
+              [{"text": "🗑 Togli questa ricerca", "callback_data": "del:{}".format(i + 1)},
+               {"text": "🔙 Le mie ricerche", "callback_data": "lista"}]]})
+
+
+def menu_paesi(i: int) -> dict:
+    righe = []
+    for codice, nome in (("it", "🇮🇹 Italia"), ("fr", "🇫🇷 Francia"), ("es", "🇪🇸 Spagna"),
+                         ("de", "🇩🇪 Germania"), ("nl", "🇳🇱 Olanda")):
+        righe.append({"text": nome, "callback_data": "ec:{}:{}".format(codice, i)})
+    return {"inline_keyboard": [
+        righe[:3], righe[3:],
+        [{"text": "🌍 Tutte le nazioni", "callback_data": "ec:all:{}".format(i)}],
+        [{"text": "🔙 Indietro", "callback_data": "edit:{}".format(i)}]]}
+
+
 def invia_lista(s: dict) -> None:
     if not s["watches"]:
         invia("Nessuna ricerca per ora. Tocca ➕ e dimmi cosa cerchi.", menu_principale())
         return
     righe = "\n".join("• " + descrivi(w, i + 1).split(". ", 1)[-1] for i, w in enumerate(s["watches"]))
-    bottoni = [[{"text": "🗑 Togli: " + w["q"][:22], "callback_data": "del:" + str(i + 1)}]
-               for i, w in enumerate(s["watches"])][:10]
-    invia("<b>🔎 Le tue ricerche</b>\n" + righe, {"inline_keyboard": bottoni})
+    bottoni = []
+    for i, w in enumerate(s["watches"][:10]):
+        bottoni.append([{"text": "✏️ " + str(i + 1) + ". " + w["q"][:18], "callback_data": "edit:" + str(i + 1)},
+                        {"text": "🗑", "callback_data": "del:" + str(i + 1)}])
+    invia("<b>🔎 Le tue ricerche</b>\n" + righe +
+          "\n\nTocca ✏️ per cambiare prezzo o nazione.", {"inline_keyboard": bottoni})
 
 
 def gestisci_comandi(s: dict) -> bool:
@@ -421,6 +512,42 @@ def gestisci_comandi(s: dict) -> bool:
             elif dati == "nuova":
                 invia("Scrivimi cosa cercare, così:\n/aggiungi harry potter blu-ray 15\n"
                       "Le parole, poi il prezzo massimo (o un intervallo 5-20).")
+            elif dati.startswith("edit:") and dati[5:].isdigit():
+                i = int(dati[5:]) - 1
+                if 0 <= i < len(s["watches"]):
+                    menu_modifica(s, i)
+                else:
+                    invia("Quella ricerca non c'è più.", menu_principale())
+            elif dati.startswith("ep:") and dati[3:].isdigit():
+                i = int(dati[3:]) - 1
+                if 0 <= i < len(s["watches"]):
+                    s["mod"] = {"i": i + 1, "campo": "prezzo", "ts": time.time()}
+                    cambiato = True
+                    invia("💶 Nuovo prezzo per «{}»\nMandami un numero (es. 30) o un intervallo (10-30).\n"
+                          "/annulla per lasciare com'è.".format(s["watches"][i]["q"]))
+                else:
+                    invia("Quella ricerca non c'è più.", menu_principale())
+            elif dati.startswith("ecm:") and dati[4:].isdigit():
+                i = int(dati[4:]) - 1
+                if 0 <= i < len(s["watches"]):
+                    s["mod"] = {"i": i + 1, "campo": "paese", "ts": time.time()}
+                    cambiato = True
+                    invia("🌍 Da quale nazione vuoi gli annunci per «{}»?\n"
+                          "Tocca un bottone o scrivimi il nome (italia, francia, spagna, germania…).".format(
+                              s["watches"][i]["q"]), menu_paesi(i + 1))
+                else:
+                    invia("Quella ricerca non c'è più.", menu_principale())
+            elif dati.startswith("ec:"):
+                resto = dati[3:].split(":")
+                if len(resto) == 2 and resto[1].isdigit():
+                    i = int(resto[1]) - 1
+                    if 0 <= i < len(s["watches"]):
+                        codice = "" if resto[0] == "all" else resto[0]
+                        invia(modifica_ricerca(s, i, "paese", codice))
+                        cambiato = True
+                        invia_lista(s)
+                    else:
+                        invia("Quella ricerca non c'è più.", menu_principale())
             elif dati.startswith("del:") and dati[4:].isdigit():
                 i = int(dati[4:]) - 1
                 if 0 <= i < len(s["watches"]):
@@ -451,6 +578,42 @@ def gestisci_comandi(s: dict) -> bool:
         elif "aiuto" in tasto and len(parti) <= 2:
             cmd = "/aiuto"
 
+        if s.get("mod") and cmd.startswith("/") and cmd not in ("/annulla",):
+            s["mod"] = None
+            cambiato = True
+
+        # scaduto? dopo 10 minuti un testo libero torna a essere una nuova ricerca
+        if s.get("mod") and time.time() - float(s["mod"].get("ts") or 0) > 600:
+            s["mod"] = None
+            cambiato = True
+
+        # sto aspettando il nuovo prezzo o la nuova nazione di una ricerca
+        if s.get("mod") and not cmd.startswith("/"):
+            mod = s["mod"]
+            i = int(mod.get("i") or 0) - 1
+            if not (0 <= i < len(s["watches"])):
+                s["mod"] = None
+                cambiato = True
+                invia("Quella ricerca non c'è più, vedi /lista.", menu_principale())
+            elif mod.get("campo") == "prezzo":
+                p = leggi_prezzo(testo)
+                if p is None:
+                    invia("Non ho capito il prezzo: mandami un numero (es. 30) o un intervallo (10-30).")
+                else:
+                    s["mod"] = None
+                    cambiato = True
+                    invia(modifica_ricerca(s, i, "prezzo", p))
+            else:
+                codice = paese_da(testo)
+                if codice is None:
+                    invia("Nazione non riconosciuta: scrivi italia, francia, spagna, germania… oppure tutte.",
+                          menu_paesi(i + 1))
+                else:
+                    s["mod"] = None
+                    cambiato = True
+                    invia(modifica_ricerca(s, i, "paese", codice))
+            continue
+
         if cmd == "/start":
             invia(BENVENUTO, tastiera())
         elif cmd in ("/nuova",):
@@ -461,6 +624,11 @@ def gestisci_comandi(s: dict) -> bool:
                   "Per un intervallo: /aggiungi funko pop naruto 10-30")
             invia("Se cambi idea: /annulla")
         elif cmd in ("/annulla",):
+            if s.get("mod"):
+                s["mod"] = None
+                cambiato = True
+                invia("Ok, lascio la ricerca com'è 🙂", tastiera())
+                continue
             ultima = s.pop("ultimo_aggiunto", None)
             if ultima:
                 for i, w in enumerate(s["watches"]):
@@ -496,6 +664,32 @@ def gestisci_comandi(s: dict) -> bool:
             cambiato = True
             invia("Aggiunta ✅\n" + descrivi(nuova, len(s["watches"])) +
                   "\nTi avviso appena esce qualcosa di nuovo. Gli annunci già online li ignoro.")
+        elif cmd in ("/modifica", "/mod", "/cambia"):
+            if not argomenti or not argomenti[0].isdigit():
+                invia("Quale ricerca cambio? /modifica numero, poi prezzo o nazione.\n"
+                      "Es.: /modifica 1 30   ·   /modifica 1 10-30   ·   /modifica 1 italia   ·   /modifica 1 tutte\n"
+                      "Vedi i numeri con /lista.")
+                continue
+            i = int(argomenti[0]) - 1
+            if not (0 <= i < len(s["watches"])):
+                invia("Numero non valido, vedi /lista.")
+                continue
+            resto = " ".join(argomenti[1:]).strip()
+            if not resto:
+                menu_modifica(s, i)
+                continue
+            p = leggi_prezzo(resto)
+            if p is not None:
+                cambiato = True
+                invia(modifica_ricerca(s, i, "prezzo", p))
+                continue
+            codice = paese_da(resto)
+            if codice is None:
+                invia("Non ho capito: dopo il numero scrivi il prezzo (30 o 10-30) "
+                      "oppure la nazione (italia, francia, spagna… o tutte).")
+                continue
+            cambiato = True
+            invia(modifica_ricerca(s, i, "paese", codice))
         elif cmd in ("/lista", "/list"):
             invia_lista(s)
         elif cmd in ("/togli", "/rimuovi", "/del"):
@@ -613,8 +807,8 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
             print("scartato (parole vietate): {}".format(n["titolo"]))
             continue
         lang = lingua("{} {}".format(n["titolo"], extra.get("descrizione", "")))
-        if w.get("solo_italia") and lang and lang != "it":
-            print("scartato (lingua {}): {}".format(lang, n["titolo"]))
+        if paese_di(w) and lang and lang != paese_di(w):
+            print("scartato (lingua {}, cerco {}): {}".format(lang, paese_di(w), n["titolo"]))
             continue
         if extra.get("venditore"):
             riga += "\n👤 {}".format(html.escape(extra["venditore"]))
