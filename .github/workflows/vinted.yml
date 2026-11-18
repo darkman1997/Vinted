@@ -31,7 +31,7 @@ jobs:
           python-version: "3.11"
 
       - name: Dipendenze
-        run: pip install --quiet langdetect
+        run: pip install --quiet langdetect || echo "langdetect non installato: filtro lingua salta questo giro"
 
       - name: Controlla gli annunci
         env:
