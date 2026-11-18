@@ -44,6 +44,7 @@ STATO = (os.environ.get("STATO") or "vinted-stato.json").strip()
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+PAROLE_VIETATE = ("paypal", "bonifico", "consegna a mano", "consegna amano", "pagamento anticipato")
 MAX_ANNUNCI = 8          # quanti annunci nuovi mostrare per ricerca in un messaggio
 TTL_GIORNI = 30          # dopo quanti giorni dimenticare gli annunci gia' visti
 MAX_VISTI = 3000         # limite per ricerca, per non far crescere il file all'infinito
@@ -509,6 +510,15 @@ def gestisci_comandi(s: dict) -> bool:
 # giro di controllo
 # --------------------------------------------------------------------------
 
+def da_scartare(*testi: str) -> bool:
+    """True se uno dei testi contiene una parola da evitare (paypal, bonifico, consegna a mano...)."""
+    for t in testi:
+        basso = (t or "").lower()
+        if any(p in basso for p in PAROLE_VIETATE):
+            return True
+    return False
+
+
 def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
     """Manda una card con foto per ogni annuncio nuovo. Ritorna quanti messaggi ha inviato."""
     def dentro(n: dict) -> bool:
@@ -533,6 +543,9 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
         if n.get("dettagli"):
             riga += " · {}".format(html.escape(n["dettagli"]))
         extra = dettagli_annuncio(n.get("link", ""))
+        if da_scartare(extra.get("descrizione", ""), extra.get("venditore", "")):
+            print("scartato ({}): {}".format("parole vietate", n["titolo"]))
+            continue
         if extra.get("venditore"):
             riga += "\n👤 {}".format(html.escape(extra["venditore"]))
             if extra.get("stelle"):
