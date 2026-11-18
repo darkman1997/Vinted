@@ -63,6 +63,7 @@ def carica() -> dict:
     s.setdefault("inoltra_a", [])
     s.setdefault("in_attesa", {})
     s.setdefault("regola", {"video": 10, "minuti": 10})
+    s.setdefault("chats", {})
     return s
 
 
@@ -147,6 +148,12 @@ def gestisci(msg: dict, s: dict) -> None:
         except Exception:
             pass
         print("non riesco a cancellare: {} {}".format(e.code, dettaglio))
+
+
+def annota_chat(msg: dict, s: dict) -> None:
+    c = msg.get("chat") or {}
+    if c.get("id"):
+        s["chats"][str(c["id"])] = {"titolo": c.get("title") or c.get("first_name") or "", "tipo": c.get("type")}
 
 
 def nome_utente(u: dict) -> str:
@@ -250,6 +257,25 @@ def comandi(msg: dict, s: dict) -> None:
            text="Doppioni cancellati: {}\nVideo in memoria: {}\nAttivo: {}\nGruppi in cui inoltro: {}".format(
                s["cancellati"], len(s["visti"]), "sì" if s["attivo"] else "no",
                len(s.get("inoltra_a") or [])))
+    elif cmd in ("/qui", "/chat"):
+        c = msg.get("chat") or {}
+        info = tg("getChat", chat_id=c.get("id"))
+        me = tg("getMe")
+        mio = (me.get("result") or {}).get("id")
+        stato = ""
+        try:
+            membro = tg("getChatMember", chat_id=c.get("id"), user_id=mio)
+            r = (membro.get("result") or {})
+            stato = r.get("status") or ""
+            if stato == "administrator":
+                stato += " (cancella: {}; banna: {})".format(
+                    "sì" if r.get("can_delete_messages") else "no",
+                    "sì" if r.get("can_restrict_members") else "no")
+        except urllib.error.HTTPError as e:
+            stato = "non riesco a leggere i miei permessi ({})".format(e.code)
+        titolo = (info.get("result") or {}).get("title") or ""
+        tg("sendMessage", chat_id=c.get("id"),
+           text="Chat: {}\nTitolo: {}\nIo sono: {}".format(c.get("id"), titolo, stato))
     elif cmd in ("/regola", "/regole"):
         pezzi = testo.split()
         if len(pezzi) >= 3 and pezzi[1].isdigit() and pezzi[2].isdigit():
@@ -287,6 +313,7 @@ def ciclo(s: dict, secondi: int) -> None:
             s["ultimo_update"] = upd["update_id"] + 1
             msg = upd.get("message") or upd.get("channel_post") or {}
             if msg:
+                annota_chat(msg, s)
                 benvenuto(msg, s)
                 conta_video(msg, s)
                 if s["attivo"]:
