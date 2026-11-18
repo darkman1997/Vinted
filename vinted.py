@@ -334,6 +334,8 @@ def descrivi(w: dict, i: int) -> str:
             extra.append(" · ".join(NOMI_STATO.get(x, x) for x in stati))
     testo = " ".join(e for e in extra if e)
     coda = (" · " + testo) if testo else ""
+    if w.get("escludi"):
+        coda += " · senza " + ", ".join(w["escludi"])
     if w.get("solo_italia"):
         coda += " · solo Italia"
     return "{}. {}{}".format(i, w["q"], coda)
@@ -345,11 +347,16 @@ def aggiungi_da_testo(s: dict, testo: str) -> dict | None:
     prezzo_min = prezzo_max = None
     stati: list[str] = []
     solo_italia = False
+    escludi: list[str] = []
     if argomenti and argomenti[-1].lower() in ("italia", "italiano"):
         solo_italia = True
         argomenti = argomenti[:-1]
     while argomenti:
         ultimo = argomenti[-1].lower()
+        if ultimo.startswith("-") and len(ultimo) > 2:
+            escludi.insert(0, ultimo[1:])
+            argomenti = argomenti[:-1]
+            continue
         if ultimo in PAROLE_STATO and ultimo not in [x.lower() for x in argomenti[:-1]]:
             stati.extend(PAROLE_STATO[ultimo])
             argomenti = argomenti[:-1]
@@ -369,7 +376,7 @@ def aggiungi_da_testo(s: dict, testo: str) -> dict | None:
     if not query:
         return None
     nuova = {"q": query, "max": prezzo_max, "min": prezzo_min, "stati": stati or [],
-             "solo_italia": solo_italia}
+             "solo_italia": solo_italia, "escludi": escludi}
     if any(chiave(w) == chiave(nuova) for w in s["watches"]):
         return nuova
     s["watches"].append(nuova)
@@ -544,6 +551,29 @@ def lingua(testo: str) -> str:
         return ""
 
 
+def normalizza(testo: str) -> str:
+    testo = (testo or "").lower()
+    for a, b in (("à", "a"), ("á", "a"), ("è", "e"), ("é", "e"), ("ì", "i"), ("í", "i"),
+                 ("ò", "o"), ("ó", "o"), ("ù", "u"), ("ú", "u"), ("-", " "), ("_", " ")):
+        testo = testo.replace(a, b)
+    return re.sub(r"[^a-z0-9 ]+", " ", testo)
+
+
+def titolo_vale(titolo: str, w: dict) -> bool:
+    """True se il titolo contiene tutte le parole cercate e nessuna di quelle escluse."""
+    t = " " + re.sub(r"\s+", " ", normalizza(titolo)) + " "
+    for parola in normalizza(w["q"]).split():
+        if len(parola) <= 2:
+            if " {} ".format(parola) not in t:
+                return False
+        elif parola not in t:
+            return False
+    for parola in w.get("escludi") or []:
+        if normalizza(parola).strip() and normalizza(parola).strip() in t:
+            return False
+    return True
+
+
 def da_scartare(*testi: str) -> bool:
     """True se uno dei testi contiene una parola da evitare (paypal, bonifico, consegna a mano...)."""
     for t in testi:
@@ -566,6 +596,11 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
         return True
 
     nuovi = [n for n in nuovi if dentro(n)]
+    fuori = [n for n in nuovi if not titolo_vale(n["titolo"], w)]
+    if fuori:
+        for n in fuori[:3]:
+            print("scartato (titolo): {}".format(n["titolo"]))
+    nuovi = [n for n in nuovi if titolo_vale(n["titolo"], w)]
     if not nuovi:
         return 0
 
