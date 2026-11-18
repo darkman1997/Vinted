@@ -85,15 +85,35 @@ def telegram(metodo: str, **campi) -> dict:
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
-def invia(testo: str) -> None:
+def invia(testo: str, markup: dict | None = None) -> None:
+    campi = dict(chat_id=CHAT_ID, text=testo, parse_mode="HTML", disable_web_page_preview="true")
+    if markup:
+        campi["reply_markup"] = json.dumps(markup)
     try:
-        telegram("sendMessage", chat_id=CHAT_ID, text=testo,
-                 parse_mode="HTML", disable_web_page_preview="true")
+        telegram("sendMessage", **campi)
     except urllib.error.HTTPError as e:
         if e.code != 400:
             raise
-        telegram("sendMessage", chat_id=CHAT_ID, text=re.sub(r"<[^>]+>", "", testo),
-                 disable_web_page_preview="true")
+        campi.update(text=re.sub(r"<[^>]+>", "", testo), parse_mode=None)
+        telegram("sendMessage", **campi)
+
+
+def invia_foto(foto: str, didascalia: str, markup: dict | None = None) -> bool:
+    campi = dict(chat_id=CHAT_ID, photo=foto, caption=didascalia, parse_mode="HTML")
+    if markup:
+        campi["reply_markup"] = json.dumps(markup)
+    try:
+        telegram("sendPhoto", **campi)
+        return True
+    except urllib.error.HTTPError:
+        return False
+
+
+def menu_principale() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "➕ Nuova ricerca", "callback_data": "nuova"},
+         {"text": "🔎 Le mie ricerche", "callback_data": "lista"}],
+        [{"text": "❓ Come funziona", "callback_data": "aiuto"}]]}
 
 
 # --------------------------------------------------------------------------
@@ -182,6 +202,11 @@ def estrai_annunci(pagina: str) -> list[dict]:
                 return ""
             return html.unescape(re.sub(r"<[^>]+>", "", mm.group(1))).strip()
 
+        img = ""
+        im = re.search(r'<img src="([^"]+)"', pezzo)
+        if im:
+            img = html.unescape(im.group(1))
+
         link = ""
         lm = re.search(r'href="(/items/[^"]+)"', pezzo)
         if lm:
@@ -193,6 +218,7 @@ def estrai_annunci(pagina: str) -> list[dict]:
             "prezzo": testo("price-text"),
             "prezzo_num": prezzo_num(testo("price-text")),
             "dettagli": testo("description-subtitle"),
+            "img": img,
             "link": link,
         })
     return annunci
@@ -227,6 +253,14 @@ PAROLE_STATO = {
     "buono": ["3"],
     "discreto": ["4"],
 }
+
+BENVENUTO = (
+    "Ciao! 👋 Sono il tuo tracker Vinted.\n\n"
+    "Sorveglio quello che cerchi e ti scrivo appena esce un annuncio, con foto, prezzo e link.\n\n"
+    "Per iniziare tocca ➕ e scrivimi cosa cerchi, per esempio:\n"
+    "/aggiungi harry potter blu-ray 15\n"
+    "Il numero finale è il prezzo massimo: puoi anche fare 5-20 per un intervallo."
+)
 
 AIUTO = (
     "Comandi:\n"
@@ -263,6 +297,16 @@ def descrivi(w: dict, i: int) -> str:
     return "{}. {}{}".format(i, w["q"], (" · " + testo) if testo else "")
 
 
+def invia_lista(s: dict) -> None:
+    if not s["watches"]:
+        invia("Nessuna ricerca per ora. Tocca ➕ e dimmi cosa cerchi.", menu_principale())
+        return
+    righe = "\n".join("• " + descrivi(w, i + 1).split(". ", 1)[-1] for i, w in enumerate(s["watches"]))
+    bottoni = [[{"text": "🗑 Togli: " + w["q"][:22], "callback_data": "del:" + str(i + 1)}]
+               for i, w in enumerate(s["watches"])][:10]
+    invia("<b>🔎 Le tue ricerche</b>\n" + righe, {"inline_keyboard": bottoni})
+
+
 def gestisci_comandi(s: dict) -> bool:
     """Legge i messaggi nuovi del bot e applica i comandi. True se qualcosa e' cambiato."""
     cambiato = False
@@ -273,6 +317,31 @@ def gestisci_comandi(s: dict) -> bool:
         return False
     for upd in ris.get("result", []):
         s["last_update_id"] = upd["update_id"] + 1
+        cq = upd.get("callback_query")
+        if cq:
+            dati = cq.get("data") or ""
+            try:
+                telegram("answerCallbackQuery", callback_query_id=cq.get("id"))
+            except (urllib.error.URLError, RuntimeError):
+                pass
+            if dati == "lista":
+                invia_lista(s)
+            elif dati == "aiuto":
+                invia(AIUTO, menu_principale())
+            elif dati == "nuova":
+                invia("Scrivimi cosa cercare, così:\n/aggiungi harry potter blu-ray 15\n"
+                      "Le parole, poi il prezzo massimo (o un intervallo 5-20).")
+            elif dati.startswith("del:") and dati[4:].isdigit():
+                i = int(dati[4:]) - 1
+                if 0 <= i < len(s["watches"]):
+                    tolta = s["watches"].pop(i)
+                    s["seen"].pop(chiave(tolta), None)
+                    cambiato = True
+                    invia("Tolta ❌ " + tolta["q"])
+                    invia_lista(s)
+                else:
+                    invia("Quella ricerca non c'è più.", menu_principale())
+            continue
         msg = upd.get("message") or upd.get("edited_message") or {}
         testo = (msg.get("text") or "").strip()
         chat = str((msg.get("chat") or {}).get("id") or "")
@@ -282,8 +351,10 @@ def gestisci_comandi(s: dict) -> bool:
         cmd = parti[0].split("@")[0].lower()
         argomenti = parti[1:]
 
-        if cmd in ("/start", "/aiuto", "/help"):
-            invia(AIUTO)
+        if cmd == "/start":
+            invia(BENVENUTO, menu_principale())
+        elif cmd in ("/aiuto", "/help"):
+            invia(AIUTO, menu_principale())
         elif cmd in ("/aggiungi", "/add"):
             if not argomenti:
                 invia("Scrivimi cosa cercare: /aggiungi parole… [prezzo o 5-20] [nuovo/ottimo/buono]")
@@ -321,11 +392,7 @@ def gestisci_comandi(s: dict) -> bool:
             invia("Aggiunta ✅\n" + descrivi(nuova, len(s["watches"])) +
                   "\nTi avviso appena esce qualcosa di nuovo. Gli annunci già online li ignoro.")
         elif cmd in ("/lista", "/list"):
-            if not s["watches"]:
-                invia("Nessuna ricerca salvata. Aggiungine una con /aggiungi.")
-            else:
-                invia("<b>Ricerche attive</b>\n" + "\n".join(
-                    descrivi(w, i + 1) for i, w in enumerate(s["watches"])))
+            invia_lista(s)
         elif cmd in ("/togli", "/rimuovi", "/del"):
             if not argomenti or not argomenti[0].isdigit():
                 invia("Quale tolgo? Mandami /togli numero (vedi /lista).")
@@ -350,7 +417,8 @@ def gestisci_comandi(s: dict) -> bool:
 # giro di controllo
 # --------------------------------------------------------------------------
 
-def componi(w: dict, nuovi: list[dict]) -> str:
+def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
+    """Manda una card con foto per ogni annuncio nuovo. Ritorna quanti messaggi ha inviato."""
     def dentro(n: dict) -> bool:
         p = n.get("prezzo_num")
         if p is None:
@@ -363,18 +431,28 @@ def componi(w: dict, nuovi: list[dict]) -> str:
 
     nuovi = [n for n in nuovi if dentro(n)]
     if not nuovi:
-        return ""
-    righe = ["<b>🛍 Nuovi annunci — {}</b>".format(html.escape(w["q"]))]
+        return 0
+
+    inviati = 0
     for n in nuovi[:MAX_ANNUNCI]:
-        riga = '• <a href="{}">{}</a>'.format(html.escape(n["link"]), html.escape(n["titolo"]))
+        riga = "<b>{}</b>".format(html.escape(n["titolo"]))
         if n.get("prezzo"):
-            riga += " — <b>{}</b>".format(html.escape(n["prezzo"]))
+            riga += "\n💶 <b>{}</b>".format(html.escape(n["prezzo"]))
         if n.get("dettagli"):
             riga += " · {}".format(html.escape(n["dettagli"]))
-        righe.append(riga)
+        riga += "\n🔎 {}".format(html.escape(w["q"]))
+        bottoni = {"inline_keyboard": [[{"text": "Apri su Vinted", "url": n["link"]}]]} if n.get("link") else None
+        ok = False
+        if n.get("img"):
+            ok = invia_foto(n["img"], riga, bottoni)
+        if not ok:
+            invia(riga + ("\n" + n["link"] if n.get("link") else ""), bottoni)
+        inviati += 1
+        time.sleep(1)
     if len(nuovi) > MAX_ANNUNCI:
-        righe.append("…e altri {} oltre a questi.".format(len(nuovi) - MAX_ANNUNCI))
-    return "\n".join(righe)
+        invia("…e altri {} nuovi per questa ricerca.".format(len(nuovi) - MAX_ANNUNCI))
+        inviati += 1
+    return inviati
 
 
 def pota(s: dict) -> None:
@@ -424,14 +502,12 @@ def giro(dry: bool = False) -> int:
         for a in annunci:
             visti.setdefault(a["id"], date.today().isoformat())
         s["seen"][k] = visti
-        testo = componi(w, nuovi)
-        if testo:
+        if nuovi:
             if dry:
-                print("---\n" + testo)
+                for n in nuovi:
+                    print("---\n{} | {} | {} | {}".format(n["titolo"], n["prezzo"], n["dettagli"], n["link"]))
             else:
-                invia(testo)
-                inviati += 1
-                time.sleep(1)
+                inviati += invia_nuovi(w, nuovi)
         time.sleep(2)
     pota(s)
     s.pop("_forza", None)
