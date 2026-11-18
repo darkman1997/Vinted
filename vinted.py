@@ -560,16 +560,11 @@ def normalizza(testo: str) -> str:
 
 
 def titolo_vale(titolo: str, w: dict) -> bool:
-    """True se il titolo contiene tutte le parole cercate e nessuna di quelle escluse."""
+    """False solo se il titolo contiene una delle parole escluse (-parola)."""
     t = " " + re.sub(r"\s+", " ", normalizza(titolo)) + " "
-    for parola in normalizza(w["q"]).split():
-        if len(parola) <= 2:
-            if " {} ".format(parola) not in t:
-                return False
-        elif parola not in t:
-            return False
     for parola in w.get("escludi") or []:
-        if normalizza(parola).strip() and normalizza(parola).strip() in t:
+        pulita = normalizza(parola).strip()
+        if pulita and " {} ".format(pulita) in t:
             return False
     return True
 
