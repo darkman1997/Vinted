@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+vinted.py — Bot Telegram "Vinted": avvisa quando escono nuovi annunci
+che corrispondono alle ricerche salvate (con prezzo massimo).
+
+Solo libreria standard di Python 3.8+ (nessun pip install).
+
+Variabili d'ambiente
+  TELEGRAM_TOKEN     obbligatoria  token del bot (da @BotFather)
+  TELEGRAM_CHAT_ID   facoltativa   default: 8798296477 (la chat di Francesco)
+  STATO              facoltativa   default vinted-stato.json
+  DOMINIO            facoltativa   default www.vinted.it
+
+Uso
+  python vinted.py --once       un giro: comandi Telegram + controllo ricerche
+  python vinted.py --dry-run    un giro senza inviare nulla e senza salvare
+  python vinted.py --test       messaggio di prova su Telegram
+  python vinted.py --aggiungi "harry potter blu-ray" 15
+  python vinted.py --lista
+  python vinted.py --togli 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import html
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime
+
+TG_BASE = "https://api.telegram.org/bot{token}/{method}"
+DOMINIO = (os.environ.get("DOMINIO") or "www.vinted.it").strip()
+TELEGRAM_TOKEN = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
+CHAT_ID = (os.environ.get("TELEGRAM_CHAT_ID") or "8798296477").strip()
+STATO = (os.environ.get("STATO") or "vinted-stato.json").strip()
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+MAX_ANNUNCI = 8          # quanti annunci nuovi mostrare per ricerca in un messaggio
+TTL_GIORNI = 30          # dopo quanti giorni dimenticare gli annunci gia' visti
+MAX_VISTI = 3000         # limite per ricerca, per non far crescere il file all'infinito
+
+
+# --------------------------------------------------------------------------
+# utilita' rete
+# --------------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _apri(url: str, referer: str = "") -> str:
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", UA)
+    req.add_header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+    req.add_header("Accept-Language", "it-IT,it;q=0.9,en;q=0.6")
+    req.add_header("Accept-Encoding", "gzip")
+    if referer:
+        req.add_header("Referer", referer)
+    with urllib.request.urlopen(req, timeout=45) as r:
+        dati = r.read()
+        if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+            try:
+                dati = gzip.decompress(dati)
+            except OSError:
+                pass
+        return dati.decode("utf-8", "replace")
+
+
+def telegram(metodo: str, **campi) -> dict:
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN mancante")
+    dati = urllib.parse.urlencode({k: v for k, v in campi.items() if v is not None}).encode()
+    req = urllib.request.Request(TG_BASE.format(token=TELEGRAM_TOKEN, method=metodo), data=dati)
+    with urllib.request.urlopen(req, timeout=45) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def invia(testo: str) -> None:
+    telegram("sendMessage", chat_id=CHAT_ID, text=testo,
+             parse_mode="HTML", disable_web_page_preview="true")
+
+
+# --------------------------------------------------------------------------
+# stato
+# --------------------------------------------------------------------------
+
+def stato_vuoto() -> dict:
+    return {"watches": [], "seen": {}, "last_update_id": 0}
+
+
+def carica_stato() -> dict:
+    if not os.path.exists(STATO):
+        return stato_vuoto()
+    try:
+        with open(STATO, encoding="utf-8") as f:
+            s = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return stato_vuoto()
+    base = stato_vuoto()
+    base.update({k: s.get(k, base[k]) for k in base})
+    return base
+
+
+def salva_stato(s: dict) -> None:
+    with open(STATO, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def chiave(w: dict) -> str:
+    return "{}|{}|{}|{}".format(w["q"].strip().lower(), w.get("min") or "",
+                                w.get("max") or "", ",".join(w.get("stati") or []))
+
+
+# --------------------------------------------------------------------------
+# Vinted
+# --------------------------------------------------------------------------
+
+CARD_RE = re.compile(r'data-testid="product-item-id-(\d+)--description-title"')
+
+
+def prezzo_num(txt: str) -> float | None:
+    m = re.search(r"(\d+(?:[.,]\d{1,2})?)", (txt or "").replace("\u00a0", " "))
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+
+
+RE_TITOLO_ATTR = re.compile(r'(?:alt|title)="([^"]{3,200})"')
+
+
+def titolo_pulito(blocco: str) -> str:
+    """Dal testo alternativo della card: toglie brand, condizioni, taglia e prezzi."""
+    for m in RE_TITOLO_ATTR.finditer(blocco):
+        testo_attr = html.unescape(m.group(1))
+        pezzi = [x.strip() for x in re.split(r",\s*", testo_attr) if x.strip()]
+        tenuti = []
+        for t in pezzi:
+            if re.match(r"^(Brand|Condizioni|Taglia|Stato|Colore|Materiale)\s*:", t, re.I):
+                break
+            if re.fullmatch(r"[\d.,]+\s*€", t):
+                break
+            tenuti.append(t)
+        if tenuti:
+            return ", ".join(tenuti)
+    return ""
+
+
+def estrai_annunci(pagina: str) -> list[dict]:
+    """Legge la griglia risultati e restituisce gli annunci trovati."""
+    annunci, visti = [], set()
+    for pezzo in pagina.split('data-testid="grid-item"')[1:]:
+        pm = re.search(r'data-testid="product-item-id-(\d+)"', pezzo)
+        if not pm:
+            continue
+        pid = pm.group(1)
+        if pid in visti:
+            continue
+        visti.add(pid)
+
+        def testo(marker: str) -> str:
+            mm = re.search(r'data-testid="product-item-id-%s--%s"[^>]*>(.*?)</' % (pid, marker), pezzo, re.S)
+            if not mm:
+                return ""
+            return html.unescape(re.sub(r"<[^>]+>", "", mm.group(1))).strip()
+
+        link = ""
+        lm = re.search(r'href="(/items/[^"]+)"', pezzo)
+        if lm:
+            link = "https://{}{}".format(DOMINIO, html.unescape(lm.group(1)).split("?")[0])
+
+        annunci.append({
+            "id": pid,
+            "titolo": titolo_pulito(pezzo) or testo("description-title") or "(senza titolo)",
+            "prezzo": testo("price-text"),
+            "prezzo_num": prezzo_num(testo("price-text")),
+            "dettagli": testo("description-subtitle"),
+            "link": link,
+        })
+    return annunci
+
+
+def cerca(w: dict) -> list[dict]:
+    params = {
+        "search_text": w["q"],
+        "order": "newest_first",
+        "currency": "EUR",
+        "page": "1",
+        "per_page": "96",
+    }
+    if w.get("max"):
+        params["price_to"] = str(w["max"])
+    if w.get("min"):
+        params["price_from"] = str(w["min"])
+    if w.get("stati"):
+        params["status_ids"] = ",".join(str(x) for x in w["stati"])
+    url = "https://{}/catalog?{}".format(DOMINIO, urllib.parse.urlencode(params))
+    pagina = _apri(url, referer="https://{}/".format(DOMINIO))
+    return estrai_annunci(pagina)
+
+
+# --------------------------------------------------------------------------
+# comandi Telegram
+# --------------------------------------------------------------------------
+
+PAROLE_STATO = {
+    "nuovo": ["6", "1"],
+    "ottimo": ["2"],
+    "buono": ["3"],
+    "discreto": ["4"],
+}
+
+AIUTO = (
+    "Comandi:\n"
+    "/aggiungi <parole> [prezzo o 5-20] [nuovo/ottimo/buono] — es. /aggiungi harry potter blu-ray 5-20 nuovo\n"
+    "/lista — ricerche attive\n"
+    "/togli <numero> — toglie una ricerca\n"
+    "/controlla — controllo subito\n"
+    "/aiuto — questo messaggio"
+)
+
+
+NOMI_STATO = {"6": "nuovo con cartellino", "1": "nuovo senza cartellino", "2": "ottimo", "3": "buono", "4": "discreto"}
+
+
+def pezzi_prezzo(w: dict) -> str:
+    if w.get("min") and w.get("max"):
+        return "{:.0f}-{:.0f} €".format(float(w["min"]), float(w["max"]))
+    if w.get("max"):
+        return "max {:.0f} €".format(float(w["max"]))
+    if w.get("min"):
+        return "da {:.0f} €".format(float(w["min"]))
+    return ""
+
+
+def descrivi(w: dict, i: int) -> str:
+    extra = [pezzi_prezzo(w)]
+    if w.get("stati"):
+        stati = [str(x) for x in w["stati"]]
+        if sorted(stati) == ["1", "6"]:
+            extra.append("nuovo")
+        else:
+            extra.append(" · ".join(NOMI_STATO.get(x, x) for x in stati))
+    testo = " ".join(e for e in extra if e)
+    return "{}. {}{}".format(i, w["q"], (" · " + testo) if testo else "")
+
+
+def gestisci_comandi(s: dict) -> bool:
+    """Legge i messaggi nuovi del bot e applica i comandi. True se qualcosa e' cambiato."""
+    cambiato = False
+    try:
+        ris = telegram("getUpdates", offset=s.get("last_update_id") or None, timeout=0)
+    except (urllib.error.URLError, RuntimeError) as e:
+        print("getUpdates: {}".format(e))
+        return False
+    for upd in ris.get("result", []):
+        s["last_update_id"] = upd["update_id"] + 1
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        testo = (msg.get("text") or "").strip()
+        chat = str((msg.get("chat") or {}).get("id") or "")
+        if not testo or (chat and chat != CHAT_ID):
+            continue
+        parti = testo.split()
+        cmd = parti[0].split("@")[0].lower()
+        argomenti = parti[1:]
+
+        if cmd in ("/start", "/aiuto", "/help"):
+            invia(AIUTO)
+        elif cmd in ("/aggiungi", "/add"):
+            if not argomenti:
+                invia("Scrivimi cosa cercare: /aggiungi <parole> [prezzo o 5-20] [nuovo/ottimo/buono]")
+                continue
+            prezzo_min = prezzo_max = None
+            stati: list[str] = []
+            while argomenti:
+                ultimo = argomenti[-1].lower()
+                if ultimo in PAROLE_STATO and ultimo not in [x.lower() for x in argomenti[:-1]]:
+                    stati.extend(PAROLE_STATO[ultimo])
+                    argomenti = argomenti[:-1]
+                    continue
+                m = re.fullmatch(r"(\d+(?:[.,]\d+)?)(?:-|–)(\d+(?:[.,]\d+)?)", ultimo)
+                if m:
+                    prezzo_min = float(m.group(1).replace(",", "."))
+                    prezzo_max = float(m.group(2).replace(",", "."))
+                    argomenti = argomenti[:-1]
+                    continue
+                if re.fullmatch(r"\d+(?:[.,]\d{1,2})?", ultimo):
+                    prezzo_max = float(ultimo.replace(",", "."))
+                    argomenti = argomenti[:-1]
+                    continue
+                break
+            query = " ".join(argomenti).strip()
+            if not query:
+                invia("Scrivimi cosa cercare: /aggiungi <parole> [prezzo o 5-20] [nuovo/ottimo/buono]")
+                continue
+            nuova = {"q": query, "max": prezzo_max, "min": prezzo_min, "stati": stati or []}
+            if any(chiave(w) == chiave(nuova) for w in s["watches"]):
+                invia("Questa ricerca c'è già: " + query)
+                continue
+            s["watches"].append(nuova)
+            s["seen"].pop(chiave(nuova), None)
+            cambiato = True
+            invia("Aggiunta ✅\n" + descrivi(nuova, len(s["watches"])) +
+                  "\nTi avviso appena esce qualcosa di nuovo. Gli annunci già online li ignoro.")
+        elif cmd in ("/lista", "/list"):
+            if not s["watches"]:
+                invia("Nessuna ricerca salvata. Aggiungine una con /aggiungi.")
+            else:
+                invia("<b>Ricerche attive</b>\n" + "\n".join(
+                    descrivi(w, i + 1) for i, w in enumerate(s["watches"])))
+        elif cmd in ("/togli", "/rimuovi", "/del"):
+            if not argomenti or not argomenti[0].isdigit():
+                invia("Quale tolgo? Mandami /togli <numero> (vedi /lista).")
+                continue
+            i = int(argomenti[0]) - 1
+            if 0 <= i < len(s["watches"]):
+                tolta = s["watches"].pop(i)
+                s["seen"].pop(chiave(tolta), None)
+                cambiato = True
+                invia("Tolta: " + tolta["q"])
+            else:
+                invia("Numero non valido, vedi /lista.")
+        elif cmd in ("/controlla", "/check"):
+            cambiato = True
+            s["_forza"] = True
+        else:
+            invia("Comando non riconosciuto.\n\n" + AIUTO)
+    return cambiato
+
+
+# --------------------------------------------------------------------------
+# giro di controllo
+# --------------------------------------------------------------------------
+
+def componi(w: dict, nuovi: list[dict]) -> str:
+    def dentro(n: dict) -> bool:
+        p = n.get("prezzo_num")
+        if p is None:
+            return True
+        if w.get("max") and p > float(w["max"]):
+            return False
+        if w.get("min") and p < float(w["min"]):
+            return False
+        return True
+
+    nuovi = [n for n in nuovi if dentro(n)]
+    if not nuovi:
+        return ""
+    righe = ["<b>🛍 Nuovi annunci — {}</b>".format(html.escape(w["q"]))]
+    for n in nuovi[:MAX_ANNUNCI]:
+        riga = '• <a href="{}">{}</a>'.format(html.escape(n["link"]), html.escape(n["titolo"]))
+        if n.get("prezzo"):
+            riga += " — <b>{}</b>".format(html.escape(n["prezzo"]))
+        if n.get("dettagli"):
+            riga += " · {}".format(html.escape(n["dettagli"]))
+        righe.append(riga)
+    if len(nuovi) > MAX_ANNUNCI:
+        righe.append("…e altri {} oltre a questi.".format(len(nuovi) - MAX_ANNUNCI))
+    return "\n".join(righe)
+
+
+def pota(s: dict) -> None:
+    limite = date.today().toordinal() - TTL_GIORNI
+    for k in list(s["seen"].keys()):
+        voci = s["seen"][k]
+        if isinstance(voci, list):  # vecchio formato
+            voci = {i: date.today().isoformat() for i in voci}
+        nuove = {i: d for i, d in voci.items()
+                 if _giorno(d) is None or _giorno(d) >= limite}
+        if len(nuove) > MAX_VISTI:
+            for i in sorted(nuove, key=lambda x: nuove[x])[: len(nuove) - MAX_VISTI]:
+                nuove.pop(i, None)
+        s["seen"][k] = nuove
+
+
+def _giorno(iso: str) -> int | None:
+    try:
+        return date.fromisoformat(iso).toordinal()
+    except (ValueError, TypeError):
+        return None
+
+
+def giro(dry: bool = False) -> int:
+    s = carica_stato()
+    if not dry:
+        gestisci_comandi(s)
+    inviati = 0
+    for w in list(s["watches"]):
+        k = chiave(w)
+        try:
+            annunci = cerca(w)
+        except (urllib.error.URLError, OSError) as e:
+            print("errore su {}: {}".format(w["q"], e))
+            time.sleep(3)
+            continue
+        visti = s["seen"].get(k) or {}
+        if isinstance(visti, list):
+            visti = {i: date.today().isoformat() for i in visti}
+        if not visti:
+            # primo giro: prendo quello che c'e' gia', senza inondare la chat
+            s["seen"][k] = {a["id"]: date.today().isoformat() for a in annunci}
+            print("[{}] base: {} annunci".format(w["q"], len(annunci)))
+            time.sleep(2)
+            continue
+        nuovi = [a for a in annunci if a["id"] not in visti]
+        for a in annunci:
+            visti.setdefault(a["id"], date.today().isoformat())
+        s["seen"][k] = visti
+        testo = componi(w, nuovi)
+        if testo:
+            if dry:
+                print("---\n" + testo)
+            else:
+                invia(testo)
+                inviati += 1
+                time.sleep(1)
+        time.sleep(2)
+    pota(s)
+    s.pop("_forza", None)
+    if not dry:
+        salva_stato(s)
+    print("giro finito: {} messaggi".format(inviati))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# riga di comando
+# --------------------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(description="Bot Vinted per Telegram")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--once", action="store_true", help="un giro completo (default)")
+    g.add_argument("--dry-run", action="store_true", help="prova senza inviare e senza salvare")
+    g.add_argument("--test", action="store_true", help="invia un messaggio di prova")
+    g.add_argument("--aggiungi", nargs="+", metavar="VOCE", help="aggiunge una ricerca")
+    g.add_argument("--lista", action="store_true", help="elenca le ricerche")
+    g.add_argument("--togli", metavar="N", help="toglie la ricerca numero N")
+    a = p.parse_args(argv)
+
+    if a.test:
+        invia("Prova del bot Vinted ✅ Se leggi questo, funziona.")
+        return 0
+    if a.aggiungi:
+        argomenti = list(a.aggiungi)
+        prezzo = None
+        if re.fullmatch(r"\d+(?:[.,]\d{1,2})?", argomenti[-1]) and len(argomenti) > 1:
+            prezzo = float(argomenti.pop().replace(",", "."))
+        s = carica_stato()
+        s["watches"].append({"q": " ".join(argomenti), "max": prezzo})
+        salva_stato(s)
+        print("aggiunta: {} (max {})".format(" ".join(argomenti), prezzo))
+        return 0
+    if a.lista:
+        s = carica_stato()
+        if not s["watches"]:
+            print("nessuna ricerca")
+        for i, w in enumerate(s["watches"]):
+            print(descrivi(w, i + 1))
+        return 0
+    if a.togli:
+        s = carica_stato()
+        i = int(a.togli) - 1
+        if 0 <= i < len(s["watches"]):
+            print("tolta: " + s["watches"].pop(i)["q"])
+            salva_stato(s)
+        else:
+            print("numero non valido")
+        return 0
+    return giro(dry=a.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
