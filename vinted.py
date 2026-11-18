@@ -36,6 +36,13 @@ import urllib.parse
 import urllib.request
 from datetime import date, datetime
 
+try:  # opzionale: serve a capire la lingua dell'annuncio
+    from langdetect import DetectorFactory, detect_langs
+    DetectorFactory.seed = 0
+except Exception:  # senza libreria il filtro lingua resta spento
+    DetectorFactory = None
+    detect_langs = None
+
 TG_BASE = "https://api.telegram.org/bot{token}/{method}"
 DOMINIO = (os.environ.get("DOMINIO") or "www.vinted.it").strip()
 TELEGRAM_TOKEN = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
@@ -326,7 +333,10 @@ def descrivi(w: dict, i: int) -> str:
         else:
             extra.append(" · ".join(NOMI_STATO.get(x, x) for x in stati))
     testo = " ".join(e for e in extra if e)
-    return "{}. {}{}".format(i, w["q"], (" · " + testo) if testo else "")
+    coda = (" · " + testo) if testo else ""
+    if w.get("solo_italia"):
+        coda += " · solo Italia"
+    return "{}. {}{}".format(i, w["q"], coda)
 
 
 def aggiungi_da_testo(s: dict, testo: str) -> dict | None:
@@ -334,6 +344,10 @@ def aggiungi_da_testo(s: dict, testo: str) -> dict | None:
     argomenti = testo.split()
     prezzo_min = prezzo_max = None
     stati: list[str] = []
+    solo_italia = False
+    if argomenti and argomenti[-1].lower() in ("italia", "italiano"):
+        solo_italia = True
+        argomenti = argomenti[:-1]
     while argomenti:
         ultimo = argomenti[-1].lower()
         if ultimo in PAROLE_STATO and ultimo not in [x.lower() for x in argomenti[:-1]]:
@@ -354,7 +368,8 @@ def aggiungi_da_testo(s: dict, testo: str) -> dict | None:
     query = " ".join(argomenti).strip()
     if not query:
         return None
-    nuova = {"q": query, "max": prezzo_max, "min": prezzo_min, "stati": stati or []}
+    nuova = {"q": query, "max": prezzo_max, "min": prezzo_min, "stati": stati or [],
+             "solo_italia": solo_italia}
     if any(chiave(w) == chiave(nuova) for w in s["watches"]):
         return nuova
     s["watches"].append(nuova)
@@ -510,6 +525,25 @@ def gestisci_comandi(s: dict) -> bool:
 # giro di controllo
 # --------------------------------------------------------------------------
 
+BANDIERE = {
+    "it": "🇮🇹", "fr": "🇫🇷", "es": "🇪🇸", "pt": "🇵🇹", "en": "🇬🇧", "de": "🇩🇪",
+    "nl": "🇳🇱", "pl": "🇵🇱", "lt": "🇱🇹", "ro": "🇷🇴", "cs": "🇨🇿", "hu": "🇭🇺",
+    "sv": "🇸🇪", "da": "🇩🇰", "fi": "🇫🇮", "el": "🇬🇷", "bg": "🇧🇬", "hr": "🇭🇷",
+    "sk": "🇸🇰", "sl": "🇸🇮", "et": "🇪🇪", "lv": "🇱🇻", "uk": "🇺🇦",
+}
+
+
+def lingua(testo: str) -> str:
+    """Lingua probabile del testo (codice a due lettere) o stringa vuota se non è chiaro."""
+    if not detect_langs or not testo or len(testo) < 20:
+        return ""
+    try:
+        migliore = detect_langs(testo)[0]
+        return migliore.lang if migliore.prob >= 0.75 else ""
+    except Exception:
+        return ""
+
+
 def da_scartare(*testi: str) -> bool:
     """True se uno dei testi contiene una parola da evitare (paypal, bonifico, consegna a mano...)."""
     for t in testi:
@@ -544,7 +578,11 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
             riga += " · {}".format(html.escape(n["dettagli"]))
         extra = dettagli_annuncio(n.get("link", ""))
         if da_scartare(extra.get("descrizione", ""), extra.get("venditore", "")):
-            print("scartato ({}): {}".format("parole vietate", n["titolo"]))
+            print("scartato (parole vietate): {}".format(n["titolo"]))
+            continue
+        lang = lingua("{} {}".format(n["titolo"], extra.get("descrizione", "")))
+        if w.get("solo_italia") and lang and lang != "it":
+            print("scartato (lingua {}): {}".format(lang, n["titolo"]))
             continue
         if extra.get("venditore"):
             riga += "\n👤 {}".format(html.escape(extra["venditore"]))
@@ -552,6 +590,8 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
                 riga += " · ⭐ {}/5".format(html.escape(extra["stelle"]))
         if extra.get("descrizione"):
             riga += "\n\n<i>{}</i>".format(html.escape(extra["descrizione"]))
+        if lang:
+            riga += "\n🌍 {}".format(BANDIERE.get(lang, lang.upper()))
         riga += "\n\n🔎 {}".format(html.escape(w["q"]))
         bottoni = {"inline_keyboard": [[{"text": "🔗 Annuncio su Vinted", "url": n["link"]}]]} if n.get("link") else None
         ok = False
