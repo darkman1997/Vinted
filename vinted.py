@@ -52,7 +52,8 @@ STATO = (os.environ.get("STATO") or "vinted-stato.json").strip()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 PAROLE_VIETATE = ("paypal", "bonifico", "consegna a mano", "consegna amano",
-                  "pagamento anticipato", "cerco")
+                  "pagamento anticipato", "cerco", "cercasi", "cerchiamo",
+                  "compro", "compriamo")
 MAX_ANNUNCI = 8          # quanti annunci nuovi mostrare per ricerca in un messaggio
 TTL_GIORNI = 30          # dopo quanti giorni dimenticare gli annunci gia' visti
 MAX_VISTI = 3000         # limite per ricerca, per non far crescere il file all'infinito
