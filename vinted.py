@@ -834,6 +834,11 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
 
 
 def pota(s: dict) -> None:
+    # via le chiavi di ricerche che non esistono piu' (rinominate o modificate)
+    attuali = {chiave(w) for w in s["watches"]}
+    for k in list(s["seen"].keys()):
+        if k not in attuali:
+            s["seen"].pop(k, None)
     limite = date.today().toordinal() - TTL_GIORNI
     for k in list(s["seen"].keys()):
         voci = s["seen"][k]
