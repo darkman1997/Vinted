@@ -86,8 +86,14 @@ def telegram(metodo: str, **campi) -> dict:
 
 
 def invia(testo: str) -> None:
-    telegram("sendMessage", chat_id=CHAT_ID, text=testo,
-             parse_mode="HTML", disable_web_page_preview="true")
+    try:
+        telegram("sendMessage", chat_id=CHAT_ID, text=testo,
+                 parse_mode="HTML", disable_web_page_preview="true")
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            raise
+        telegram("sendMessage", chat_id=CHAT_ID, text=re.sub(r"<[^>]+>", "", testo),
+                 disable_web_page_preview="true")
 
 
 # --------------------------------------------------------------------------
@@ -224,9 +230,9 @@ PAROLE_STATO = {
 
 AIUTO = (
     "Comandi:\n"
-    "/aggiungi <parole> [prezzo o 5-20] [nuovo/ottimo/buono] — es. /aggiungi harry potter blu-ray 5-20 nuovo\n"
+    "/aggiungi parole… [prezzo o 5-20] [nuovo/ottimo/buono] — es. /aggiungi harry potter blu-ray 5-20 nuovo\n"
     "/lista — ricerche attive\n"
-    "/togli <numero> — toglie una ricerca\n"
+    "/togli numero — toglie una ricerca\n"
     "/controlla — controllo subito\n"
     "/aiuto — questo messaggio"
 )
@@ -280,7 +286,7 @@ def gestisci_comandi(s: dict) -> bool:
             invia(AIUTO)
         elif cmd in ("/aggiungi", "/add"):
             if not argomenti:
-                invia("Scrivimi cosa cercare: /aggiungi <parole> [prezzo o 5-20] [nuovo/ottimo/buono]")
+                invia("Scrivimi cosa cercare: /aggiungi parole… [prezzo o 5-20] [nuovo/ottimo/buono]")
                 continue
             prezzo_min = prezzo_max = None
             stati: list[str] = []
@@ -303,7 +309,7 @@ def gestisci_comandi(s: dict) -> bool:
                 break
             query = " ".join(argomenti).strip()
             if not query:
-                invia("Scrivimi cosa cercare: /aggiungi <parole> [prezzo o 5-20] [nuovo/ottimo/buono]")
+                invia("Scrivimi cosa cercare: /aggiungi parole… [prezzo o 5-20] [nuovo/ottimo/buono]")
                 continue
             nuova = {"q": query, "max": prezzo_max, "min": prezzo_min, "stati": stati or []}
             if any(chiave(w) == chiave(nuova) for w in s["watches"]):
@@ -322,7 +328,7 @@ def gestisci_comandi(s: dict) -> bool:
                     descrivi(w, i + 1) for i, w in enumerate(s["watches"])))
         elif cmd in ("/togli", "/rimuovi", "/del"):
             if not argomenti or not argomenti[0].isdigit():
-                invia("Quale tolgo? Mandami /togli <numero> (vedi /lista).")
+                invia("Quale tolgo? Mandami /togli numero (vedi /lista).")
                 continue
             i = int(argomenti[0]) - 1
             if 0 <= i < len(s["watches"]):
