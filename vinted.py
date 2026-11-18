@@ -328,6 +328,40 @@ def descrivi(w: dict, i: int) -> str:
     return "{}. {}{}".format(i, w["q"], (" · " + testo) if testo else "")
 
 
+def aggiungi_da_testo(s: dict, testo: str) -> dict | None:
+    """Crea una ricerca da testo libero: parole [prezzo|min-max] [condizione]."""
+    argomenti = testo.split()
+    prezzo_min = prezzo_max = None
+    stati: list[str] = []
+    while argomenti:
+        ultimo = argomenti[-1].lower()
+        if ultimo in PAROLE_STATO and ultimo not in [x.lower() for x in argomenti[:-1]]:
+            stati.extend(PAROLE_STATO[ultimo])
+            argomenti = argomenti[:-1]
+            continue
+        m = re.fullmatch(r"(\d+(?:[.,]\d+)?)(?:-|–)(\d+(?:[.,]\d+)?)", ultimo)
+        if m:
+            prezzo_min = float(m.group(1).replace(",", "."))
+            prezzo_max = float(m.group(2).replace(",", "."))
+            argomenti = argomenti[:-1]
+            continue
+        if re.fullmatch(r"\d+(?:[.,]\d{1,2})?", ultimo):
+            prezzo_max = float(ultimo.replace(",", "."))
+            argomenti = argomenti[:-1]
+            continue
+        break
+    query = " ".join(argomenti).strip()
+    if not query:
+        return None
+    nuova = {"q": query, "max": prezzo_max, "min": prezzo_min, "stati": stati or []}
+    if any(chiave(w) == chiave(nuova) for w in s["watches"]):
+        return nuova
+    s["watches"].append(nuova)
+    s["seen"].pop(chiave(nuova), None)
+    s["ultimo_aggiunto"] = chiave(nuova)
+    return nuova
+
+
 def invia_lista(s: dict) -> None:
     if not s["watches"]:
         invia("Nessuna ricerca per ora. Tocca ➕ e dimmi cosa cerchi.", menu_principale())
@@ -402,7 +436,19 @@ def gestisci_comandi(s: dict) -> bool:
                   "Per un intervallo: /aggiungi funko pop naruto 10-30")
             invia("Se cambi idea: /annulla")
         elif cmd in ("/annulla",):
-            invia("Va bene, niente da fare 🙂", tastiera())
+            ultima = s.pop("ultimo_aggiunto", None)
+            if ultima:
+                for i, w in enumerate(s["watches"]):
+                    if chiave(w) == ultima:
+                        tolta = s["watches"].pop(i)
+                        s["seen"].pop(chiave(tolta), None)
+                        cambiato = True
+                        invia("Tolta: " + tolta["q"], tastiera())
+                        break
+                else:
+                    invia("Niente da annullare 🙂", tastiera())
+            else:
+                invia("Niente da annullare 🙂", tastiera())
         elif cmd in ("/stato",):
             quante = len(s["watches"])
             ultimo = s.get("ultimo_giro") or "—"
@@ -414,35 +460,14 @@ def gestisci_comandi(s: dict) -> bool:
             if not argomenti:
                 invia("Scrivimi cosa cercare: /aggiungi parole… [prezzo o 5-20] [nuovo/ottimo/buono]")
                 continue
-            prezzo_min = prezzo_max = None
-            stati: list[str] = []
-            while argomenti:
-                ultimo = argomenti[-1].lower()
-                if ultimo in PAROLE_STATO and ultimo not in [x.lower() for x in argomenti[:-1]]:
-                    stati.extend(PAROLE_STATO[ultimo])
-                    argomenti = argomenti[:-1]
-                    continue
-                m = re.fullmatch(r"(\d+(?:[.,]\d+)?)(?:-|–)(\d+(?:[.,]\d+)?)", ultimo)
-                if m:
-                    prezzo_min = float(m.group(1).replace(",", "."))
-                    prezzo_max = float(m.group(2).replace(",", "."))
-                    argomenti = argomenti[:-1]
-                    continue
-                if re.fullmatch(r"\d+(?:[.,]\d{1,2})?", ultimo):
-                    prezzo_max = float(ultimo.replace(",", "."))
-                    argomenti = argomenti[:-1]
-                    continue
-                break
-            query = " ".join(argomenti).strip()
-            if not query:
-                invia("Scrivimi cosa cercare: /aggiungi parole… [prezzo o 5-20] [nuovo/ottimo/buono]")
+            gia = len(s["watches"])
+            nuova = aggiungi_da_testo(s, " ".join(argomenti))
+            if nuova is None:
+                invia("Scrivimi cosa cercare: /aggiungi parole… [prezzo o 5-20]")
                 continue
-            nuova = {"q": query, "max": prezzo_max, "min": prezzo_min, "stati": stati or []}
-            if any(chiave(w) == chiave(nuova) for w in s["watches"]):
-                invia("Questa ricerca c'è già: " + query)
+            if len(s["watches"]) == gia:
+                invia("Questa ricerca c'è già: " + nuova["q"])
                 continue
-            s["watches"].append(nuova)
-            s["seen"].pop(chiave(nuova), None)
             cambiato = True
             invia("Aggiunta ✅\n" + descrivi(nuova, len(s["watches"])) +
                   "\nTi avviso appena esce qualcosa di nuovo. Gli annunci già online li ignoro.")
@@ -463,6 +488,18 @@ def gestisci_comandi(s: dict) -> bool:
         elif cmd in ("/controlla", "/check"):
             cambiato = True
             s["_forza"] = True
+        elif not testo.startswith("/"):
+            gia = len(s["watches"])
+            nuova = aggiungi_da_testo(s, testo)
+            if nuova is None:
+                invia("Scrivimi cosa cercare: per esempio \"xbox x 200-280\".")
+                continue
+            if len(s["watches"]) == gia:
+                invia("Questa ricerca c'è già: " + nuova["q"])
+                continue
+            cambiato = True
+            invia("Ho messo d'occhio 👀\n" + descrivi(nuova, len(s["watches"])) +
+                  "\nSe non va bene: /annulla")
         else:
             invia("Comando non riconosciuto.\n\n" + AIUTO)
     return cambiato
