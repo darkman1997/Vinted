@@ -109,6 +109,14 @@ def invia_foto(foto: str, didascalia: str, markup: dict | None = None) -> bool:
         return False
 
 
+def tastiera() -> dict:
+    return {"keyboard": [
+        [{"text": "➕ Nuova ricerca"}, {"text": "📋 Le mie ricerche"}],
+        [{"text": "📊 Stato"}, {"text": "❓ Aiuto"}]],
+        "resize_keyboard": True,
+        "is_persistent": True}
+
+
 def menu_principale() -> dict:
     return {"inline_keyboard": [
         [{"text": "➕ Nuova ricerca", "callback_data": "nuova"},
@@ -222,6 +230,29 @@ def estrai_annunci(pagina: str) -> list[dict]:
             "link": link,
         })
     return annunci
+
+
+def dettagli_annuncio(link: str) -> dict:
+    """Apre l'annuncio e legge venditore, valutazione e descrizione."""
+    dati = {"venditore": "", "stelle": "", "descrizione": ""}
+    if not link:
+        return dati
+    try:
+        pagina = _apri(link, referer="https://{}/".format(DOMINIO))
+    except (urllib.error.URLError, OSError):
+        return dati
+    m = re.search(r'data-testid="profile-username">([^<]+)<', pagina)
+    if m:
+        dati["venditore"] = html.unescape(m.group(1)).strip()
+    m = re.search(r"valutazione di ([\d,.]+) su 5", pagina)
+    if m:
+        dati["stelle"] = m.group(1).replace(".", ",")
+    m = re.search(r'og:description" content="([^"]*)"', pagina)
+    if m:
+        testo = html.unescape(m.group(1))
+        testo = re.sub(r"\s+", " ", testo).strip()
+        dati["descrizione"] = testo[:220]
+    return dati
 
 
 def cerca(w: dict) -> list[dict]:
@@ -351,8 +382,32 @@ def gestisci_comandi(s: dict) -> bool:
         cmd = parti[0].split("@")[0].lower()
         argomenti = parti[1:]
 
+        tasto = testo.lower()
+        if "nuova ricerca" in tasto:
+            cmd, argomenti = "/nuova", []
+        elif "le mie ricerche" in tasto:
+            cmd = "/lista"
+        elif "stato" in tasto and len(parti) <= 2:
+            cmd = "/stato"
+        elif "aiuto" in tasto and len(parti) <= 2:
+            cmd = "/aiuto"
+
         if cmd == "/start":
-            invia(BENVENUTO, menu_principale())
+            invia(BENVENUTO, tastiera())
+        elif cmd in ("/nuova",):
+            invia("🔎 Cosa vuoi tenere d'occhio?\n"
+                  "Scrivimi il nome come lo cercheresti su Vinted, con il prezzo massimo:\n\n"
+                  "/aggiungi ps5 250\n"
+                  "/aggiungi nintendo switch oled 200\n\n"
+                  "Per un intervallo: /aggiungi funko pop naruto 10-30")
+            invia("Se cambi idea: /annulla")
+        elif cmd in ("/annulla",):
+            invia("Va bene, niente da fare 🙂", tastiera())
+        elif cmd in ("/stato",):
+            quante = len(s["watches"])
+            ultimo = s.get("ultimo_giro") or "—"
+            invia("<b>📊 Stato</b>\nRicerche attive: {}\nUltimo controllo: {}\n"
+                  "Controllo automatico: ogni 30 minuti.".format(quante, html.escape(ultimo)), menu_principale())
         elif cmd in ("/aiuto", "/help"):
             invia(AIUTO, menu_principale())
         elif cmd in ("/aggiungi", "/add"):
@@ -440,8 +495,15 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
             riga += "\n💶 <b>{}</b>".format(html.escape(n["prezzo"]))
         if n.get("dettagli"):
             riga += " · {}".format(html.escape(n["dettagli"]))
-        riga += "\n🔎 {}".format(html.escape(w["q"]))
-        bottoni = {"inline_keyboard": [[{"text": "Apri su Vinted", "url": n["link"]}]]} if n.get("link") else None
+        extra = dettagli_annuncio(n.get("link", ""))
+        if extra.get("venditore"):
+            riga += "\n👤 {}".format(html.escape(extra["venditore"]))
+            if extra.get("stelle"):
+                riga += " · ⭐ {}/5".format(html.escape(extra["stelle"]))
+        if extra.get("descrizione"):
+            riga += "\n\n<i>{}</i>".format(html.escape(extra["descrizione"]))
+        riga += "\n\n🔎 {}".format(html.escape(w["q"]))
+        bottoni = {"inline_keyboard": [[{"text": "🔗 Annuncio su Vinted", "url": n["link"]}]]} if n.get("link") else None
         ok = False
         if n.get("img"):
             ok = invia_foto(n["img"], riga, bottoni)
@@ -510,6 +572,7 @@ def giro(dry: bool = False) -> int:
                 inviati += invia_nuovi(w, nuovi)
         time.sleep(2)
     pota(s)
+    s["ultimo_giro"] = datetime.now().isoformat(timespec="minutes")
     s.pop("_forza", None)
     if not dry:
         salva_stato(s)
