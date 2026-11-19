@@ -1,6 +1,6 @@
 name: Vinted
 
-# Controlla i nuovi annunci delle ricerche salvate.
+# Resta in ascolto dei comandi Telegram e controlla i nuovi annunci.
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -22,7 +22,7 @@ permissions:
 jobs:
   controlla:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -34,31 +34,41 @@ jobs:
         run: |
           pip install --quiet langdetect || echo "langdetect non installato: filtro lingua salta questo giro"
 
-      - name: Controlla gli annunci
+      - name: Messaggio di prova
+        if: ${{ inputs.prova == 'true' }}
         env:
           TELEGRAM_TOKEN: ${{ secrets.VINTED_TELEGRAM_TOKEN }}
-        run: |
-          echo "token length: ${#TELEGRAM_TOKEN}"
-          if [ "${{ inputs.prova }}" = "true" ]; then
-            python vinted.py --test
-          else
-            python vinted.py --once
-          fi
+        run: python vinted.py --test
+
+      - name: Ascolta i comandi e controlla gli annunci
+        if: ${{ inputs.prova != 'true' }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.VINTED_TELEGRAM_TOKEN }}
+          SECONDI_ASCOLTO: "420"          # resta in ascolto 7 minuti
+          INTERVALLO_CONTROLLO: "120"     # cerca nuovi annunci ogni 2 minuti
+          ATTESA_POLL: "20"               # long polling: risposta in pochi secondi
+        run: python vinted.py --loop
 
       - name: Salva lo stato
+        if: always()
         run: |
           git config user.name bot
           git config user.email bot@users.noreply.github.com
           git add vinted-stato.json
           git diff --staged --quiet || git commit -m "vinted stato"
-          git push
+          for tentativo in 1 2 3 4; do
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; git checkout -- .; git reset --hard origin/main; }
+            git push && break
+            sleep 5
+          done
 
       - name: Prossimo giro (catena)
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sleep 240
+          sleep 20
           curl -s -o /dev/null -w 'next=%{http_code}\n' -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \

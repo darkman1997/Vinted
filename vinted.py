@@ -11,8 +11,13 @@ Variabili d'ambiente
   TELEGRAM_CHAT_ID   facoltativa   default: 8798296477 (la chat di Francesco)
   STATO              facoltativa   default vinted-stato.json
   DOMINIO            facoltativa   default www.vinted.it
+  SECONDI_ASCOLTO    facoltativa   default 420 (quanto resta in ascolto prima di uscire)
+  INTERVALLO_CONTROLLO facoltativa default 120 (ogni quanti secondi cerca gli annunci)
+  ATTESA_POLL        facoltativa   default 20 (long polling Telegram, secondi)
 
 Uso
+  python vinted.py --loop       ascolta i comandi in continuo e controlla gli annunci
+                                ogni INTERVALLO_CONTROLLO secondi (modalita' GitHub)
   python vinted.py --once       un giro: comandi Telegram + controllo ricerche
   python vinted.py --dry-run    un giro senza inviare nulla e senza salvare
   python vinted.py --test       messaggio di prova su Telegram
@@ -48,6 +53,18 @@ DOMINIO = (os.environ.get("DOMINIO") or "www.vinted.it").strip()
 TELEGRAM_TOKEN = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
 CHAT_ID = (os.environ.get("TELEGRAM_CHAT_ID") or "8798296477").strip()
 STATO = (os.environ.get("STATO") or "vinted-stato.json").strip()
+
+
+def _num(nome: str, default: int) -> int:
+    try:
+        return int(os.environ.get(nome) or default)
+    except ValueError:
+        return default
+
+
+SECONDI_ASCOLTO = _num("SECONDI_ASCOLTO", 420)
+INTERVALLO_CONTROLLO = _num("INTERVALLO_CONTROLLO", 120)
+ATTESA_POLL = _num("ATTESA_POLL", 20)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -488,11 +505,15 @@ def invia_lista(s: dict) -> None:
           "\n\nTocca ✏️ per cambiare prezzo o nazione.", {"inline_keyboard": bottoni})
 
 
-def gestisci_comandi(s: dict) -> bool:
-    """Legge i messaggi nuovi del bot e applica i comandi. True se qualcosa e' cambiato."""
+def gestisci_comandi(s: dict, attesa: int = 0) -> bool:
+    """Legge i messaggi nuovi del bot e applica i comandi. True se qualcosa e' cambiato.
+
+    Con attesa > 0 usa il long polling: il messaggio arriva subito, senza aspettare
+    il prossimo giro (e' quello che rende il bot veloce a rispondere).
+    """
     cambiato = False
     try:
-        ris = telegram("getUpdates", offset=s.get("last_update_id") or None, timeout=0)
+        ris = telegram("getUpdates", offset=s.get("last_update_id") or None, timeout=attesa)
     except (urllib.error.URLError, RuntimeError) as e:
         print("getUpdates: {}".format(e))
         return False
@@ -646,7 +667,7 @@ def gestisci_comandi(s: dict) -> bool:
             quante = len(s["watches"])
             ultimo = s.get("ultimo_giro") or "—"
             invia("<b>📊 Stato</b>\nRicerche attive: {}\nUltimo controllo: {}\n"
-                  "Controllo automatico: ogni 30 minuti.".format(quante, html.escape(ultimo)), menu_principale())
+                  "Controllo automatico: ogni 2 minuti; i comandi li leggo subito.".format(quante, html.escape(ultimo)), menu_principale())
         elif cmd in ("/aiuto", "/help"):
             invia(AIUTO, menu_principale())
         elif cmd in ("/aggiungi", "/add"):
@@ -859,10 +880,8 @@ def _giorno(iso: str) -> int | None:
         return None
 
 
-def giro(dry: bool = False) -> int:
-    s = carica_stato()
-    if not dry:
-        gestisci_comandi(s)
+def controlla_ricerche(s: dict, dry: bool = False) -> int:
+    """Controlla tutte le ricerche salvate e avvisa dei nuovi annunci."""
     inviati = 0
     for w in list(s["watches"]):
         k = chiave(w)
@@ -898,6 +917,54 @@ def giro(dry: bool = False) -> int:
     if not dry:
         salva_stato(s)
     print("giro finito: {} messaggi".format(inviati))
+    return inviati
+
+
+def giro(dry: bool = False) -> int:
+    """Un giro singolo: comandi Telegram + controllo ricerche."""
+    s = carica_stato()
+    if not dry:
+        if gestisci_comandi(s):
+            salva_stato(s)
+    controlla_ricerche(s, dry)
+    return 0
+
+
+def ciclo(secondi: int | None = None) -> int:
+    """Resta in ascolto e risponde ai comandi in pochi secondi.
+
+    Alterna long polling su Telegram (cosi' il messaggio viene letto subito)
+    e un controllo degli annunci ogni INTERVALLO_CONTROLLO secondi. Dopo
+    SECONDI_ASCOLTO esce e la GitHub Action rilancia il giro successivo.
+    """
+    durata = max(60, int(secondi or SECONDI_ASCOLTO))
+    s = carica_stato()
+    fine = time.time() + durata
+    prossimo = time.time()          # primo controllo appena parte
+    print("ascolto per {}s, controllo annunci ogni {}s".format(durata, INTERVALLO_CONTROLLO))
+    while time.time() < fine:
+        # 1) e' ora di cercare gli annunci?
+        if time.time() >= prossimo:
+            try:
+                controlla_ricerche(s, dry=False)
+            except Exception as e:  # un errore non deve fermare l'ascolto
+                print("errore nel controllo: {}".format(e))
+            salva_stato(s)
+            prossimo = time.time() + INTERVALLO_CONTROLLO
+            continue
+        # 2) ascolto i comandi (long polling: risposta immediata)
+        try:
+            cambiato = gestisci_comandi(s, attesa=ATTESA_POLL)
+        except Exception as e:  # rete ballerina: riprovo tra poco
+            print("errore in ascolto: {}".format(e))
+            time.sleep(3)
+            continue
+        if cambiato:
+            salva_stato(s)          # niente comandi persi se il job muore
+            if s.get("_forza"):     # /controlla -> controllo subito
+                prossimo = 0
+    salva_stato(s)
+    print("fine ascolto, passo il giro al run successivo")
     return 0
 
 
@@ -908,6 +975,7 @@ def giro(dry: bool = False) -> int:
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description="Bot Vinted per Telegram")
     g = p.add_mutually_exclusive_group()
+    g.add_argument("--loop", action="store_true", help="ascolta i comandi e controlla a intervalli")
     g.add_argument("--once", action="store_true", help="un giro completo (default)")
     g.add_argument("--dry-run", action="store_true", help="prova senza inviare e senza salvare")
     g.add_argument("--test", action="store_true", help="invia un messaggio di prova")
@@ -919,6 +987,8 @@ def main(argv: list[str]) -> int:
     if a.test:
         invia("Prova del bot Vinted ✅ Se leggi questo, funziona.")
         return 0
+    if a.loop:
+        return ciclo()
     if a.aggiungi:
         argomenti = list(a.aggiungi)
         prezzo = None
