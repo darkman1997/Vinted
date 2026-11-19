@@ -62,4 +62,4 @@ jobs:
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -d '{"ref":"main"}' \
-            "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/vinted.yml/dispatches" || true
+            "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/vinted-bot.yml/dispatches" || true
