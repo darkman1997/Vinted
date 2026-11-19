@@ -38,6 +38,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.VINTED_TELEGRAM_TOKEN }}
         run: |
+          echo "token length: ${#TELEGRAM_TOKEN}"
           if [ "${{ inputs.prova }}" = "true" ]; then
             python vinted.py --test
           else
