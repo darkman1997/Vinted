@@ -103,6 +103,25 @@ def _apri(url: str, referer: str = "") -> str:
         return dati.decode("utf-8", "replace")
 
 
+def _apri_json(url: str, referer: str = "") -> dict:
+    """Come _apri ma per gli endpoint /api/v2 (risposta JSON)."""
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", UA)
+    req.add_header("Accept", "application/json, text/plain, */*")
+    req.add_header("Accept-Language", "it-IT,it;q=0.9,en;q=0.6")
+    req.add_header("Accept-Encoding", "gzip")
+    if referer:
+        req.add_header("Referer", referer)
+    with urllib.request.urlopen(req, timeout=45) as r:
+        dati = r.read()
+        if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+            try:
+                dati = gzip.decompress(dati)
+            except OSError:
+                pass
+        return json.loads(dati.decode("utf-8", "replace"))
+
+
 def telegram(metodo: str, **campi) -> dict:
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN mancante")
@@ -263,9 +282,72 @@ def estrai_annunci(pagina: str) -> list[dict]:
     return annunci
 
 
+def _formatta_voto(valore) -> str:
+    """Voto gia' sulla scala 0-5, scritto con la virgola e un decimale."""
+    try:
+        v = float(str(valore).replace(",", "."))
+    except (TypeError, ValueError):
+        return ""
+    return "{:.1f}".format(max(0.0, min(5.0, v))).replace(".", ",")
+
+
+def _voto_su_5(valore) -> str:
+    """Vinted a volte manda feedback_reputation come frazione 0-1: la porto su 5."""
+    try:
+        v = float(str(valore).replace(",", "."))
+    except (TypeError, ValueError):
+        return ""
+    if 0.0 <= v <= 1.0:
+        v = v * 5
+    return _formatta_voto(v)
+
+
+def _estrai_voto(pagina: str) -> tuple[str, str]:
+    """Legge dall'annuncio il voto del venditore e quante recensioni ha in totale.
+
+    Prova prima i dati dentro la pagina (feedback_reputation / feedback_count),
+    poi il testo visibile ("valutazione di 4,5 su 5", "10 recensioni").
+    """
+    voto, recensioni = "", ""
+    m = re.search(r'"feedback_reputation"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)', pagina)
+    if m:
+        voto = _voto_su_5(m.group(1))
+    m = re.search(r'"feedback_count"\s*:\s*"?([0-9]+)', pagina)
+    if m:
+        recensioni = m.group(1)
+    if not voto:
+        m = re.search(r"valutazione di ([0-9]+(?:[.,][0-9]+)?) su 5", pagina, re.IGNORECASE)
+        if m:
+            voto = _formatta_voto(m.group(1))
+    if not recensioni:
+        m = re.search(r"([0-9]+)\s*(?:recension|feedback|valutazion)", pagina, re.IGNORECASE)
+        if m:
+            recensioni = m.group(1)
+    return voto, recensioni
+
+
+def venditore_da_api(link: str) -> dict:
+    """Rete di sicurezza: se la pagina non basta, chiede il venditore all'API."""
+    m = re.search(r"/items/(\d+)", link or "")
+    if not m:
+        return {}
+    try:
+        dati = _apri_json("https://{}/api/v2/items/{}".format(DOMINIO, m.group(1)))
+    except (urllib.error.URLError, OSError, ValueError):
+        return {}
+    u = ((dati or {}).get("item") or {}).get("user") or {}
+    if not u:
+        return {}
+    return {
+        "venditore": (u.get("login") or "").strip(),
+        "stelle": _voto_su_5(u.get("feedback_reputation")) if u.get("feedback_reputation") is not None else "",
+        "recensioni": str(u.get("feedback_count") or "") if u.get("feedback_count") is not None else "",
+    }
+
+
 def dettagli_annuncio(link: str) -> dict:
     """Apre l'annuncio e legge venditore, valutazione e descrizione."""
-    dati = {"venditore": "", "stelle": "", "descrizione": ""}
+    dati = {"venditore": "", "stelle": "", "recensioni": "", "descrizione": ""}
     if not link:
         return dati
     try:
@@ -275,9 +357,12 @@ def dettagli_annuncio(link: str) -> dict:
     m = re.search(r'data-testid="profile-username">([^<]+)<', pagina)
     if m:
         dati["venditore"] = html.unescape(m.group(1)).strip()
-    m = re.search(r"valutazione di ([\d,.]+) su 5", pagina)
-    if m:
-        dati["stelle"] = m.group(1).replace(".", ",")
+    dati["stelle"], dati["recensioni"] = _estrai_voto(pagina)
+    if not dati["stelle"] or not dati["recensioni"]:
+        api = venditore_da_api(link)
+        dati["venditore"] = dati["venditore"] or api.get("venditore", "")
+        dati["stelle"] = dati["stelle"] or api.get("stelle", "")
+        dati["recensioni"] = dati["recensioni"] or api.get("recensioni", "")
     m = re.search(r'og:description" content="([^"]*)"', pagina)
     if m:
         testo = html.unescape(m.group(1))
@@ -833,8 +918,17 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
             continue
         if extra.get("venditore"):
             riga += "\n👤 {}".format(html.escape(extra["venditore"]))
-            if extra.get("stelle"):
-                riga += " · ⭐ {}/5".format(html.escape(extra["stelle"]))
+            voto = extra.get("stelle") or ""
+            quante = extra.get("recensioni") or ""
+            # voto a sinistra, recensioni totali a destra: "4,5/10"
+            if voto and quante:
+                riga += " · ⭐ {}/{}".format(html.escape(voto), html.escape(quante))
+            elif voto:
+                riga += " · ⭐ {}/5".format(html.escape(voto))
+            elif quante:
+                riga += " · ⭐ –/{}".format(html.escape(quante))
+            else:
+                riga += " · ⭐ nessuna recensione"
         if extra.get("descrizione"):
             riga += "\n\n<i>{}</i>".format(html.escape(extra["descrizione"]))
         if lang:
