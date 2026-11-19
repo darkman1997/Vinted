@@ -1,7 +1,8 @@
 {
-  "last_update_id": 206853627,
+  "last_update_id": 206853635,
   "mod": null,
   "seen": {
+    "iphone 15 300-400 italia batteria|||||": {},
     "xbox x|150.0|280.0||it|one": {
       "10801404341": "2026-11-18",
       "10815425335": "2026-11-18",
@@ -181,7 +182,8 @@
       "9872444911": "2026-11-18"
     }
   },
-  "ultimo_giro": "2026-11-19T03:17",
+  "ultimo_aggiunto": "iphone 15 300-400 italia batteria|||||",
+  "ultimo_giro": "2026-11-19T03:28",
   "watches": [
     {
       "escludi": [
@@ -191,6 +193,14 @@
       "min": 150.0,
       "paese": "it",
       "q": "xbox x",
+      "stati": []
+    },
+    {
+      "escludi": [],
+      "max": null,
+      "min": null,
+      "paese": "",
+      "q": "iPhone 15 300-400 italia batteria",
       "stati": []
     }
   ]
