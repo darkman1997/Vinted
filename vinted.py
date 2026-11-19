@@ -302,28 +302,90 @@ def _voto_su_5(valore) -> str:
     return _formatta_voto(v)
 
 
+def _solo_numero(valore) -> str:
+    """Tiene solo le cifre: serve al conteggio recensioni, mai a un voto."""
+    m = re.search(r"([0-9]{1,6})", str(valore or ""))
+    return m.group(1) if m else ""
+
+
+# Da qui deve uscire SOLO il numero di recensioni totali (un intero):
+# prima le chiavi JSON, poi il testo visibile. Mai un voto.
+PATTERN_RECENSIONI = (
+    r'"feedback_count"\s*:\s*"?([0-9]{1,6})',
+    r'"feedbacks_count"\s*:\s*"?([0-9]{1,6})',
+    r'"rating_count"\s*:\s*"?([0-9]{1,6})',
+    r'"reviews_count"\s*:\s*"?([0-9]{1,6})',
+    r"([0-9]{1,6})\s*recension[ei]",
+    r"([0-9]{1,6})\s*feedback",
+    r"([0-9]{1,6})\s*valutazion[ei]",
+    r"([0-9]{1,6})\s*reviews?",
+)
+
+
+def _blocco_valutazione(pagina: str) -> str:
+    """Il pezzo di pagina dove Vinted mostra stelle e numero di recensioni."""
+    for chiave in ("profile-ratings", "profile-feedback", "rating"):
+        m = re.search(r'data-testid="[^"]*{}[^"]*"'.format(chiave), pagina, re.IGNORECASE)
+        if m:
+            return pagina[m.start():m.start() + 700]
+    m = re.search(r"(valutazione di|recension)", pagina, re.IGNORECASE)
+    if m:
+        return pagina[max(0, m.start() - 300):m.start() + 700]
+    return ""
+
+
+def _estrai_recensioni(pagina: str) -> str:
+    """Quante recensioni ha in totale il venditore. Vuoto se non si capisce."""
+    blocco = _blocco_valutazione(pagina)
+    for testo in (blocco, pagina):
+        if not testo:
+            continue
+        for pat in PATTERN_RECENSIONI:
+            m = re.search(pat, testo, re.IGNORECASE)
+            if m:
+                return m.group(1)
+    return ""
+
+
 def _estrai_voto(pagina: str) -> tuple[str, str]:
     """Legge dall'annuncio il voto del venditore e quante recensioni ha in totale.
 
-    Prova prima i dati dentro la pagina (feedback_reputation / feedback_count),
-    poi il testo visibile ("valutazione di 4,5 su 5", "10 recensioni").
+    Il voto viene dalle stelle; il conteggio solo da feedback_count o dal testo
+    "N recensioni". Se il conteggio non si trova resta vuoto: non va mai
+    sostituito con la scala del voto.
     """
-    voto, recensioni = "", ""
+    voto = ""
     m = re.search(r'"feedback_reputation"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)', pagina)
     if m:
         voto = _voto_su_5(m.group(1))
-    m = re.search(r'"feedback_count"\s*:\s*"?([0-9]+)', pagina)
-    if m:
-        recensioni = m.group(1)
     if not voto:
         m = re.search(r"valutazione di ([0-9]+(?:[.,][0-9]+)?) su 5", pagina, re.IGNORECASE)
         if m:
             voto = _formatta_voto(m.group(1))
-    if not recensioni:
-        m = re.search(r"([0-9]+)\s*(?:recension|feedback|valutazion)", pagina, re.IGNORECASE)
-        if m:
-            recensioni = m.group(1)
-    return voto, recensioni
+    return voto, _estrai_recensioni(pagina)
+
+
+def riga_venditore(extra: dict) -> str:
+    """Riga del venditore: a sinistra il voto, a destra SOLO le recensioni totali.
+
+    Esempio: 👤 mario · ⭐ 4,5/10 (4,5 di voto su 10 recensioni).
+    Il numero a destra non e' mai un voto, nemmeno quando il conteggio manca:
+    in quel caso la riga mostra soltanto il voto.
+    """
+    if not extra.get("venditore"):
+        return ""
+    riga = "👤 {}".format(html.escape(str(extra["venditore"])))
+    voto = (extra.get("stelle") or "").strip()
+    quante = _solo_numero(extra.get("recensioni"))
+    if voto and quante:
+        riga += " · ⭐ {}/{}".format(html.escape(voto), quante)
+    elif voto:
+        riga += " · ⭐ {}".format(html.escape(voto))
+    elif quante:
+        riga += " · ⭐ –/{}".format(quante)
+    else:
+        riga += " · ⭐ nessuna recensione"
+    return riga
 
 
 def venditore_da_api(link: str) -> dict:
@@ -341,7 +403,7 @@ def venditore_da_api(link: str) -> dict:
     return {
         "venditore": (u.get("login") or "").strip(),
         "stelle": _voto_su_5(u.get("feedback_reputation")) if u.get("feedback_reputation") is not None else "",
-        "recensioni": str(u.get("feedback_count") or "") if u.get("feedback_count") is not None else "",
+        "recensioni": _solo_numero(u.get("feedback_count")) if u.get("feedback_count") is not None else "",
     }
 
 
@@ -916,19 +978,9 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
         if paese_di(w) and lang and lang != paese_di(w):
             print("scartato (lingua {}, cerco {}): {}".format(lang, paese_di(w), n["titolo"]))
             continue
-        if extra.get("venditore"):
-            riga += "\n👤 {}".format(html.escape(extra["venditore"]))
-            voto = extra.get("stelle") or ""
-            quante = extra.get("recensioni") or ""
-            # voto a sinistra, recensioni totali a destra: "4,5/10"
-            if voto and quante:
-                riga += " · ⭐ {}/{}".format(html.escape(voto), html.escape(quante))
-            elif voto:
-                riga += " · ⭐ {}/5".format(html.escape(voto))
-            elif quante:
-                riga += " · ⭐ –/{}".format(html.escape(quante))
-            else:
-                riga += " · ⭐ nessuna recensione"
+        riga_v = riga_venditore(extra)
+        if riga_v:
+            riga += "\n" + riga_v
         if extra.get("descrizione"):
             riga += "\n\n<i>{}</i>".format(html.escape(extra["descrizione"]))
         if lang:
@@ -946,6 +998,58 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
         invia("…e altri {} nuovi per questa ricerca.".format(len(nuovi) - MAX_ANNUNCI))
         inviati += 1
     return inviati
+
+
+def diagnostica(link: str = "") -> int:
+    """Stampa nei log cosa il bot legge davvero per un annuncio (non manda nulla)."""
+    s = carica_stato()
+    if not link:
+        w = dict(s["watches"][0]) if s.get("watches") else {"q": "galaxy watch"}
+        w.pop("max", None)
+        try:
+            annunci = cerca(w)
+        except Exception as e:
+            print("ricerca fallita: {} {}".format(type(e).__name__, e))
+            annunci = []
+        print("ricerca «{}»: {} annunci trovati".format(w.get("q"), len(annunci)))
+        link = annunci[0]["link"] if annunci else ""
+    if not link:
+        link = "https://{}/items/10879614942".format(DOMINIO)
+    print("DIAGNOSTICA annuncio: {}".format(link))
+
+    m = re.search(r"/items/(\d+)", link)
+    if m:
+        url = "https://{}/api/v2/items/{}".format(DOMINIO, m.group(1))
+        print("API: {}".format(url))
+        try:
+            dati = _apri_json(url)
+            u = ((dati or {}).get("item") or {}).get("user") or {}
+            print("API ok. chiavi user: {}".format(",".join(sorted(u.keys()))))
+            for campo in ("login", "feedback_count", "feedback_reputation",
+                          "positive_feedback_count", "neutral_feedback_count",
+                          "negative_feedback_count", "item_count"):
+                print("   {} = {!r}".format(campo, u.get(campo)))
+        except Exception as e:
+            print("API errore: {} {}".format(type(e).__name__, e))
+
+    try:
+        pagina = _apri(link, referer="https://{}/".format(DOMINIO))
+    except Exception as e:
+        print("pagina errore: {} {}".format(type(e).__name__, e))
+        return 1
+    print("HTML: {} caratteri".format(len(pagina)))
+    for parola in ('feedback_count', 'feedback_reputation', 'valutazione di',
+                   'recension', 'profile-ratings'):
+        for mm in list(re.finditer(re.escape(parola), pagina, re.IGNORECASE))[:2]:
+            pezzo = re.sub(r"\s+", " ", pagina[max(0, mm.start() - 100):mm.end() + 120])
+            print("   [{}] ...{}...".format(parola, pezzo[:240]))
+    voto, quante = _estrai_voto(pagina)
+    print("ESTRATTO dalla pagina -> voto={!r} recensioni={!r}".format(voto, quante))
+    extra = dettagli_annuncio(link)
+    print("DETTAGLI -> venditore={!r} stelle={!r} recensioni={!r}".format(
+        extra.get("venditore"), extra.get("stelle"), extra.get("recensioni")))
+    print("RIGA -> {}".format(riga_venditore(extra)))
+    return 0
 
 
 def pota(s: dict) -> None:
@@ -1070,6 +1174,8 @@ def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description="Bot Vinted per Telegram")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--loop", action="store_true", help="ascolta i comandi e controlla a intervalli")
+    g.add_argument("--diagnostica", metavar="URL", nargs="?", const="", default=None,
+                   help="stampa nei log voto e recensioni letti davvero (non manda nulla)")
     g.add_argument("--once", action="store_true", help="un giro completo (default)")
     g.add_argument("--dry-run", action="store_true", help="prova senza inviare e senza salvare")
     g.add_argument("--test", action="store_true", help="invia un messaggio di prova")
@@ -1083,6 +1189,8 @@ def main(argv: list[str]) -> int:
         return 0
     if a.loop:
         return ciclo()
+    if a.diagnostica is not None:
+        return diagnostica(a.diagnostica)
     if a.aggiungi:
         argomenti = list(a.aggiungi)
         prezzo = None
