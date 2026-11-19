@@ -1,0 +1,30 @@
+name: Diagnostica voto
+
+# Serve solo a leggere nei log cosa il bot trova davvero su un annuncio.
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL annuncio (vuoto = primo risultato della prima ricerca)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  leggi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cosa legge il bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.VINTED_TELEGRAM_TOKEN }}
+        run: |
+          python vinted.py --diagnostica "${{ inputs.url }}" 2>&1 | tail -60
