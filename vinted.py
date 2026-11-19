@@ -310,11 +310,13 @@ def _solo_numero(valore) -> str:
 
 # Da qui deve uscire SOLO il numero di recensioni totali (un intero):
 # prima le chiavi JSON, poi il testo visibile. Mai un voto.
+# Vinted incastra il JSON dentro l'HTML, quindi le virgolette possono avere
+# un backslash davanti: \"feedback_count\":8 -> il backslash e' opzionale.
 PATTERN_RECENSIONI = (
-    r'"feedback_count"\s*:\s*"?([0-9]{1,6})',
-    r'"feedbacks_count"\s*:\s*"?([0-9]{1,6})',
-    r'"rating_count"\s*:\s*"?([0-9]{1,6})',
-    r'"reviews_count"\s*:\s*"?([0-9]{1,6})',
+    r'\\?"feedback_count\\?"\s*:\s*"?([0-9]{1,6})',
+    r'\\?"feedbacks_count\\?"\s*:\s*"?([0-9]{1,6})',
+    r'\\?"rating_count\\?"\s*:\s*"?([0-9]{1,6})',
+    r'\\?"reviews_count\\?"\s*:\s*"?([0-9]{1,6})',
     r"([0-9]{1,6})\s*recension[ei]",
     r"([0-9]{1,6})\s*feedback",
     r"([0-9]{1,6})\s*valutazion[ei]",
@@ -355,7 +357,7 @@ def _estrai_voto(pagina: str) -> tuple[str, str]:
     sostituito con la scala del voto.
     """
     voto = ""
-    m = re.search(r'"feedback_reputation"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)', pagina)
+    m = re.search(r'\\?"feedback_reputation\\?"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)', pagina)
     if m:
         voto = _voto_su_5(m.group(1))
     if not voto:
@@ -1000,10 +1002,40 @@ def invia_nuovi(w: dict, nuovi: list[dict]) -> int:
     return inviati
 
 
+def _diagnostica_uno(link: str) -> None:
+    print("DIAGNOSTICA annuncio: {}".format(link))
+    m = re.search(r"/items/(\d+)", link)
+    if m:
+        url = "https://{}/api/v2/items/{}".format(DOMINIO, m.group(1))
+        try:
+            dati = _apri_json(url)
+            u = ((dati or {}).get("item") or {}).get("user") or {}
+            print("API ok: login={!r} feedback_count={!r} feedback_reputation={!r}".format(
+                u.get("login"), u.get("feedback_count"), u.get("feedback_reputation")))
+        except Exception as e:
+            print("API errore: {} {}".format(type(e).__name__, e))
+    try:
+        pagina = _apri(link, referer="https://{}/".format(DOMINIO))
+    except Exception as e:
+        print("pagina errore: {} {}".format(type(e).__name__, e))
+        return
+    print("HTML: {} caratteri".format(len(pagina)))
+    for parola in ("feedback_count", "feedback_reputation"):
+        mm = re.search(r'\\\\?"{}'.format(parola), pagina)
+        if mm:
+            pezzo = re.sub(r"\s+", " ", pagina[mm.start():mm.start() + 150])
+            print("   [{}] {}".format(parola, pezzo[:150]))
+    extra = dettagli_annuncio(link)
+    print("DETTAGLI -> venditore={!r} stelle={!r} recensioni={!r}".format(
+        extra.get("venditore"), extra.get("stelle"), extra.get("recensioni")))
+    print("RIGA -> {}".format(riga_venditore(extra)))
+
+
 def diagnostica(link: str = "") -> int:
-    """Stampa nei log cosa il bot legge davvero per un annuncio (non manda nulla)."""
-    s = carica_stato()
-    if not link:
+    """Stampa nei log cosa il bot legge davvero su 3 annunci (non manda nulla)."""
+    links = [link] if link else []
+    if not links:
+        s = carica_stato()
         w = dict(s["watches"][0]) if s.get("watches") else {"q": "galaxy watch"}
         w.pop("max", None)
         try:
@@ -1012,43 +1044,12 @@ def diagnostica(link: str = "") -> int:
             print("ricerca fallita: {} {}".format(type(e).__name__, e))
             annunci = []
         print("ricerca «{}»: {} annunci trovati".format(w.get("q"), len(annunci)))
-        link = annunci[0]["link"] if annunci else ""
-    if not link:
-        link = "https://{}/items/10879614942".format(DOMINIO)
-    print("DIAGNOSTICA annuncio: {}".format(link))
-
-    m = re.search(r"/items/(\d+)", link)
-    if m:
-        url = "https://{}/api/v2/items/{}".format(DOMINIO, m.group(1))
-        print("API: {}".format(url))
-        try:
-            dati = _apri_json(url)
-            u = ((dati or {}).get("item") or {}).get("user") or {}
-            print("API ok. chiavi user: {}".format(",".join(sorted(u.keys()))))
-            for campo in ("login", "feedback_count", "feedback_reputation",
-                          "positive_feedback_count", "neutral_feedback_count",
-                          "negative_feedback_count", "item_count"):
-                print("   {} = {!r}".format(campo, u.get(campo)))
-        except Exception as e:
-            print("API errore: {} {}".format(type(e).__name__, e))
-
-    try:
-        pagina = _apri(link, referer="https://{}/".format(DOMINIO))
-    except Exception as e:
-        print("pagina errore: {} {}".format(type(e).__name__, e))
-        return 1
-    print("HTML: {} caratteri".format(len(pagina)))
-    for parola in ('feedback_count', 'feedback_reputation', 'valutazione di',
-                   'recension', 'profile-ratings'):
-        for mm in list(re.finditer(re.escape(parola), pagina, re.IGNORECASE))[:2]:
-            pezzo = re.sub(r"\s+", " ", pagina[max(0, mm.start() - 100):mm.end() + 120])
-            print("   [{}] ...{}...".format(parola, pezzo[:240]))
-    voto, quante = _estrai_voto(pagina)
-    print("ESTRATTO dalla pagina -> voto={!r} recensioni={!r}".format(voto, quante))
-    extra = dettagli_annuncio(link)
-    print("DETTAGLI -> venditore={!r} stelle={!r} recensioni={!r}".format(
-        extra.get("venditore"), extra.get("stelle"), extra.get("recensioni")))
-    print("RIGA -> {}".format(riga_venditore(extra)))
+        links = [a["link"] for a in annunci[:3] if a.get("link")]
+    if not links:
+        links = ["https://{}/items/10879614942".format(DOMINIO)]
+    for l in links:
+        _diagnostica_uno(l)
+        print("-" * 40)
     return 0
 
 
