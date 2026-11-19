@@ -1,0 +1,64 @@
+name: Vinted
+
+# Controlla i nuovi annunci delle ricerche salvate.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      prova:
+        description: "Manda un messaggio di prova invece di controllare"
+        type: boolean
+        default: false
+
+concurrency:
+  group: vinted
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  controlla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dipendenze
+        run: pip install --quiet langdetect || echo "langdetect non installato: filtro lingua salta questo giro"
+
+      - name: Controlla gli annunci
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.VINTED_TELEGRAM_TOKEN }}
+        run: |
+          if [ "${{ inputs.prova }}" = "true" ]; then
+            python vinted.py --test
+          else
+            python vinted.py --once
+          fi
+
+      - name: Salva lo stato
+        run: |
+          git config user.name bot
+          git config user.email bot@users.noreply.github.com
+          git add vinted-stato.json
+          git diff --staged --quiet || git commit -m "vinted stato"
+          git push
+
+      - name: Prossimo giro (catena)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 240
+          curl -s -o /dev/null -w 'next=%{http_code}\n' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"ref":"main"}' \
+            "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/vinted.yml/dispatches" || true
